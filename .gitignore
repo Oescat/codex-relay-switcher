@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.backups/
+.verification/
+*.dpapi
+config.toml
+auth.json
+.env
+.env.*
+
