@@ -354,6 +354,42 @@ def _validate_models(models):
     return result
 
 
+def _optional_model(value):
+    """Validate an optional model ID, where an empty value means no override."""
+    if not isinstance(value, str):
+        raise RelayError('Auto Review 模型必须是文本。')
+    value = value.strip()
+    return _validate_models([value])[0] if value else ''
+
+
+def _catalog_auto_review_model(home, config):
+    """Read the current model's reviewer override without exposing catalog data."""
+    catalog_value = config.get('model_catalog_json')
+    model = config.get('model')
+    if not isinstance(catalog_value, str) or not catalog_value.strip() or not isinstance(model, str):
+        return ''
+    path = Path(catalog_value).expanduser()
+    if not path.is_absolute():
+        path = Path(home) / path
+    try:
+        home = Path(home).expanduser().resolve()
+        path = path.resolve()
+        if not path.is_relative_to(home):
+            return ''
+        raw = path.read_bytes()
+        if len(raw) > 10 * 1024 * 1024:
+            return ''
+        catalog = json.loads(raw.decode('utf-8-sig'))
+        entries = catalog.get('models', []) if isinstance(catalog, dict) else []
+        matches = [entry for entry in entries
+                   if isinstance(entry, dict) and entry.get('slug') == model]
+        if len(matches) != 1:
+            return ''
+        return _optional_model(matches[0].get('auto_review_model_override', '') or '')
+    except (OSError, ValueError, TypeError, UnicodeError, RelayError):
+        return ''
+
+
 class RelayManager:
     @_safe
     def __init__(self, home):
@@ -372,6 +408,7 @@ class RelayManager:
                     imported['id'] = uuid.uuid4().hex
                     imported['models'] = [imported['model']] if imported['model'] else []
                     imported['reasoning_effort'] = current['reasoning_effort']
+                    imported['auto_review_model'] = current['auto_review_model']
                     profiles.append(imported)
                 self._save(profiles)
 
@@ -409,6 +446,8 @@ class RelayManager:
                     raise ValueError
                 profile['models'] = _validate_models(profile.get('models', []))
                 profile['reasoning_effort'] = _reasoning_effort(profile.get('reasoning_effort', 'high'))
+                if 'auto_review_model' in profile:
+                    profile['auto_review_model'] = _optional_model(profile['auto_review_model'])
             return result['profiles']
         except (ValueError, UnicodeError):
             raise RelayError('站点资料损坏，未修改配置。') from None
@@ -430,7 +469,8 @@ class RelayManager:
         default_url = config.get('openai_base_url', '') if provider_id == 'openai' else ''
         current = dict(name=provider.get('name', provider_id), base_url=provider.get('base_url', default_url),
                        model=config.get('model', ''),
-                       reasoning_effort=_stored_reasoning_effort(config.get('model_reasoning_effort', 'high')))
+                       reasoning_effort=_stored_reasoning_effort(config.get('model_reasoning_effort', 'high')),
+                       auto_review_model=_catalog_auto_review_model(self.home, config))
         key = provider.get('experimental_bearer_token', '')
         if not key and isinstance(provider.get('env_key'), str):
             key = _environment(provider['env_key'])
@@ -454,6 +494,8 @@ class RelayManager:
             for profile in self._load():
                 if profile['base_url'].rstrip('/') == result['base_url'].rstrip('/') and profile['api_key'] == key and (not profile['model'] or profile['model'] == result['model']):
                     result['id'] = profile['id']
+                    if 'auto_review_model' in profile:
+                        result['auto_review_model'] = profile['auto_review_model']
                     break
             return result
 
@@ -471,21 +513,31 @@ class RelayManager:
         raise RelayError('站点不存在，请刷新列表。')
 
     @_safe
-    def save_profile(self, name, base_url, api_key, model='', profile_id=None, models=None, reasoning_effort=None):
+    def save_profile(self, name, base_url, api_key, model='', profile_id=None, models=None,
+                     reasoning_effort=None, auto_review_model=None):
         profile = _validate(name, base_url, api_key, model)
         new_models = _validate_models(models) if models is not None else None
+        new_auto_review_model = _optional_model(auto_review_model) if auto_review_model is not None else None
         with self._locked():
             profiles = self._load()
             previous = next((item for item in profiles if item['id'] == profile_id), None)
             if profile_id is not None and previous is None:
                 raise RelayError('站点已被另一窗口删除，请刷新列表。')
+            same_connection = (previous is not None and previous['base_url'] == profile['base_url']
+                               and previous['api_key'] == profile['api_key'])
             profile['reasoning_effort'] = _reasoning_effort(
                 reasoning_effort if reasoning_effort is not None else
                 previous.get('reasoning_effort', 'high') if previous is not None else 'high'
             )
+            if new_auto_review_model is not None:
+                profile['auto_review_model'] = new_auto_review_model
+            elif same_connection and 'auto_review_model' in previous:
+                profile['auto_review_model'] = previous['auto_review_model']
+            elif not same_connection:
+                profile['auto_review_model'] = ''
             if new_models is not None:
                 profile['models'] = new_models
-            elif previous is not None and previous['base_url'] == profile['base_url'] and previous['api_key'] == profile['api_key']:
+            elif same_connection:
                 profile['models'] = previous['models']
             else:
                 profile['models'] = []
@@ -537,7 +589,10 @@ class RelayManager:
             if not isinstance(effective_model, str) or not effective_model.strip():
                 raise RelayError('请先选择或填写默认模型，再切换站点。')
             from relay_catalog import write_model_catalog
-            catalog_path = write_model_catalog(self.home, parsed, stored_profile.get('models', []), effective_model)
+            catalog_path = write_model_catalog(
+                self.home, parsed, stored_profile.get('models', []), effective_model,
+                auto_review_model=stored_profile.get('auto_review_model', '')
+            )
             profile['reasoning_effort'] = stored_profile.get('reasoning_effort', 'high')
             provider_ids = _global_provider_ids(parsed, stored_profiles)
             result = _new_config(original, profile, catalog_path, provider_ids)

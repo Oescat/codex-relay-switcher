@@ -1,7 +1,17 @@
 """Regression checks for global relay switching, using synthetic configuration."""
+import json
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from relay_core import REASONING_EFFORTS, _global_provider_ids, _new_config, _parse
+from relay_core import REASONING_EFFORTS, RelayManager, _global_provider_ids, _new_config, _parse
+
+
+@contextmanager
+def _no_lock():
+    yield
 
 
 class GlobalRelayConfigTests(unittest.TestCase):
@@ -83,6 +93,50 @@ base_url = "https://other.example/v1"
                 self.assertEqual(after['agents']['default_subagent_reasoning_effort'], 'max')
         profile = {key: value for key, value in self.profile.items() if key != 'reasoning_effort'}
         self.assertEqual(_parse(_new_config(b'', profile))['model_reasoning_effort'], 'high')
+
+    def test_auto_review_model_is_saved_per_station_and_cleared_on_connection_change(self):
+        with (TemporaryDirectory() as temporary,
+              patch('relay_core._crypt', side_effect=lambda data, encrypt: data),
+              patch.object(RelayManager, '_locked', autospec=True,
+                           side_effect=lambda self: _no_lock())):
+            manager = RelayManager(Path(temporary))
+            profile_id = manager.save_profile(
+                'station', 'https://relay.example/v1', 'synthetic-test-token',
+                model='main-model', auto_review_model='review-model'
+            )
+            self.assertEqual(manager.get_profile(profile_id)['auto_review_model'], 'review-model')
+
+            manager.save_profile(
+                'station', 'https://relay.example/v1', 'synthetic-test-token',
+                model='main-model', profile_id=profile_id
+            )
+            self.assertEqual(manager.get_profile(profile_id)['auto_review_model'], 'review-model')
+
+            manager.save_profile(
+                'station', 'https://another.example/v1', 'synthetic-test-token',
+                model='main-model', profile_id=profile_id
+            )
+            self.assertEqual(manager.get_profile(profile_id)['auto_review_model'], '')
+
+    def test_switch_writes_auto_review_override_to_codex_catalog(self):
+        with (TemporaryDirectory() as temporary,
+              patch('relay_core._crypt', side_effect=lambda data, encrypt: data),
+              patch.object(RelayManager, '_locked', autospec=True,
+                           side_effect=lambda self: _no_lock())):
+            manager = RelayManager(Path(temporary))
+            profile_id = manager.save_profile(
+                'station', 'https://relay.example/v1', 'synthetic-test-token',
+                model='main-model', models=['main-model', 'second-model'],
+                auto_review_model='review-model'
+            )
+            manager.switch(profile_id)
+
+            config = _parse(manager.config.read_bytes())
+            catalog_path = Path(config['model_catalog_json'])
+            catalog = json.loads(catalog_path.read_text(encoding='utf-8'))
+            self.assertEqual(config['model'], 'main-model')
+            self.assertEqual({item['auto_review_model_override'] for item in catalog['models']},
+                             {'review-model'})
 
 
 if __name__ == '__main__':

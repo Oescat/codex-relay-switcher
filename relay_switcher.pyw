@@ -225,13 +225,15 @@ class Switcher(tk.Tk):
         super().__init__()
         self.withdraw()
         self.title("Codex 中转站切换器")
-        self.geometry("960x700")
-        self.minsize(790, 610)
+        self.geometry("960x750")
+        self.minsize(790, 660)
         self.configure(bg=BG)
         self.manager = None
         self.profiles = {}
         self.fetching = False
         self.model_profile_id = None
+        self.current_profile_id = None
+        self.current_auto_review_model = ""
         self.configure_styles()
         self.build_window()
         try:
@@ -312,8 +314,19 @@ class Switcher(tk.Tk):
         self.effort_combo.pack(side="left")
         self.fetch_button = ttk.Button(model_controls, text="获取模型", command=self.fetch)
         self.fetch_button.pack(side="left", padx=(12, 0))
+        review_controls = ttk.Frame(main)
+        review_controls.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(review_controls, text="Auto Review 模型", style="Field.TLabel").pack(side="left", padx=(0, 12))
+        self.selected_review_model = tk.StringVar()
+        self.review_model_combo = ttk.Combobox(
+            review_controls, textvariable=self.selected_review_model, width=38
+        )
+        self.review_model_combo.pack(side="left", fill="x", expand=True)
+        ttk.Label(review_controls, text="留空使用 Codex 默认 reviewer", style="Muted.TLabel").pack(
+            side="left", padx=(10, 0)
+        )
         controls = ttk.Frame(main)
-        controls.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+        controls.grid(row=6, column=0, sticky="ew", pady=(16, 0))
         self.edit_button = ttk.Button(controls, text="编辑", command=self.edit)
         self.edit_button.pack(side="left")
         self.delete_button = ttk.Button(controls, text="删除", command=self.delete)
@@ -324,15 +337,16 @@ class Switcher(tk.Tk):
                                         command=self.switch)
         self.switch_button.pack(side="right")
         ttk.Label(main, text="应用时更新全局默认设置，并同步旧中转入口；子代理默认思考强度为 max。\n"
+                            "Auto Review 模型应用到此站点全部主模型；留空由 Codex 默认选择。此项不会启用 Auto Review，也不影响 /review。\n"
                             "light 对应 Codex 的 low。请完全退出并重开 Codex，再打开已有或新对话。",
-                  style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=(16, 0))
+                  style="Muted.TLabel").grid(row=7, column=0, sticky="w", pady=(16, 0))
         self.status = tk.StringVar(value="选择一个站点，然后点击切换。")
         ttk.Label(main, textvariable=self.status, foreground=ACCENT).grid(
-            row=7, column=0, sticky="w", pady=(12, 12)
+            row=8, column=0, sticky="w", pady=(12, 12)
         )
-        ttk.Separator(main).grid(row=8, column=0, sticky="ew")
+        ttk.Separator(main).grid(row=9, column=0, sticky="ew")
         footer = ttk.Frame(main)
-        footer.grid(row=9, column=0, sticky="ew", pady=(12, 0))
+        footer.grid(row=10, column=0, sticky="ew", pady=(12, 0))
         self.path_text = tk.StringVar(value="配置目录尚未加载")
         ttk.Label(footer, textvariable=self.path_text, style="Muted.TLabel").pack(side="left")
         ttk.Button(footer, text="更换配置目录", command=self.choose_home).pack(side="right")
@@ -353,15 +367,23 @@ class Switcher(tk.Tk):
         self.fetch_button.configure(state="normal" if state == "normal" and not self.fetching else "disabled")
         self.model_combo.configure(state=state)
         self.effort_combo.configure(state=state)
+        self.review_model_combo.configure(state=state)
         if selected != self.model_profile_id:
             self.model_profile_id = selected
             profile = self.profiles.get(selected, {})
             self.selected_model.set(profile.get("model", ""))
             self.selected_effort.set(profile.get("reasoning_effort", "high"))
+            self.selected_review_model.set(profile.get(
+                "auto_review_model",
+                self.current_auto_review_model if selected == self.current_profile_id else ""
+            ))
             self.model_combo.configure(values=profile.get("models", []))
+            self.review_model_combo.configure(values=profile.get("models", []))
 
     def refresh(self, select=None):
         current = self.manager.current()
+        self.current_profile_id = current.get("id")
+        self.current_auto_review_model = current.get("auto_review_model", "")
         profiles = self.manager.list_profiles()
         self.profiles = {profile["id"]: profile for profile in profiles}
         self.tree.delete(*self.tree.get_children())
@@ -417,6 +439,7 @@ class Switcher(tk.Tk):
                                                   updated.get("model") or "沿用当前默认模型"))
                 if self.selected_id() == profile_id:
                     self.model_combo.configure(values=catalog.models)
+                    self.review_model_combo.configure(values=catalog.models)
                 self.status.set(f"“{station_name}”已缓存 {len(catalog.models)} 个模型，请选择默认模型后点击切换。" +
                                 ("已更新 API 地址。" if catalog.base_url != base_url else ""))
             except Exception as exc:
@@ -476,7 +499,8 @@ class Switcher(tk.Tk):
             profile = self.manager.get_profile(profile_id)
             self.manager.save_profile(profile["name"], profile["base_url"], profile["api_key"],
                                       model=self.selected_model.get(), profile_id=profile_id,
-                                      reasoning_effort=self.selected_effort.get())
+                                      reasoning_effort=self.selected_effort.get(),
+                                      auto_review_model=self.selected_review_model.get())
             profile.clear()
             provider_ids = self.manager.switch(profile_id)
             name = self.profiles[profile_id]["name"]

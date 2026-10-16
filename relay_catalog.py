@@ -104,7 +104,8 @@ def _fallback(model):
     }
 
 
-def write_model_catalog(home: Path, config: dict, models: list[str], default_model: str) -> Path:
+def write_model_catalog(home: Path, config: dict, models: list[str], default_model: str,
+                        auto_review_model: str = '') -> Path:
     """Expose all fetched IDs and mark the chosen model as Codex's default.
 
     Explicit user catalogs are required to be readable. The optional Codex cache
@@ -117,6 +118,14 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
         if (not isinstance(default_model, str) or not default_model.strip()
                 or any(ord(char) < 32 or ord(char) == 127 for char in default_model)):
             raise RelayError('请先选择或填写一个有效的默认模型。')
+        if not isinstance(auto_review_model, str) or any(ord(char) < 32 or ord(char) == 127
+                                                        for char in auto_review_model):
+            raise RelayError('Auto Review 模型必须是有效的模型名称。')
+        auto_review_model = auto_review_model.strip()
+        if not auto_review_model:
+            auto_review_model = None
+        else:
+            auto_review_model = _validate_models([auto_review_model])[0]
         fetched = _validate_models(models)
         ordered = [default_model] + [model for model in fetched if model != default_model]
         home = Path(home).expanduser().resolve()
@@ -142,7 +151,8 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
             entry = resolved.get(model) or _fallback(model)
             # Every fetched option must be visible, while the chosen default
             # sorts first. Avoid upgrades that would suggest an unlisted model.
-            entry.update(visibility='list', supported_in_api=True, priority=priority, upgrade=None)
+            entry.update(visibility='list', supported_in_api=True, priority=priority, upgrade=None,
+                         auto_review_model_override=auto_review_model)
             _validate_entry(entry)
             entries.append(entry)
         raw = (json.dumps({'models': entries}, ensure_ascii=False, sort_keys=True,

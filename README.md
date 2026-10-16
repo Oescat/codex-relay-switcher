@@ -7,6 +7,8 @@ Windows GUI for switching Codex relay providers and global model defaults.
 - Manage multiple relay profiles locally.
 - Fetch available models from a relay's `/models` endpoint.
 - Set the global Codex provider, model, model catalog, and default reasoning effort.
+- Choose an optional per-relay Auto Review model override from `/models` or enter a model ID manually.
+- Auto Review model selection is separate from Auto Review activation and the `/review` model setting.
 - Supported reasoning effort choices: `light`, `medium`, `high`, `xhigh`, `max`, `ultra`.
 - Default sub-agent reasoning effort is `max`.
 - Keep a rollback copy of the previous Codex configuration.
@@ -36,6 +38,7 @@ The default Codex home is `%USERPROFILE%\\.codex`. Set `CODEX_HOME` or use the G
 ```
 
 After switching or restoring the global configuration, completely close and reopen Codex so the new configuration is loaded.
+Leave the Auto Review model blank to let Codex choose its default reviewer. A selected override is written to the relay model catalog for each model from that relay; the model ID must be supported by the relay. This does not enable Auto Review or configure the separate `/review` model.
 
 ## Security
 
