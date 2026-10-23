@@ -2,9 +2,12 @@ __pycache__/
 *.py[cod]
 .backups/
 .verification/
+.upload_staging_*/
+codex-relay-switcher-*.zip
 *.dpapi
 config.toml
 auth.json
 .env
 .env.*
+.image-api-test-key.txt
 

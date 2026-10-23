@@ -264,6 +264,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
                 raise RelayError('根节点使用了内联或点式 agents 定义，请先改成独立 [agents] 表。配置未修改。')
             if ('model_provider' in entry or (profile['model'] and 'model' in entry)
                     or 'model_reasoning_effort' in entry
+                    or 'conversationDetailMode' in entry
                     or (catalog_path is not None and 'model_catalog_json' in entry)):
                 continue
         retained.append(statement)
@@ -273,6 +274,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
     if profile['model']:
         prefix += 'model = ' + _quote(profile['model']) + newline
     prefix += 'model_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[reasoning_effort]) + newline
+    prefix += 'conversationDetailMode = "STEPS_COMMANDS"' + newline
     if catalog_path is not None:
         prefix += 'model_catalog_json = ' + _quote(str(catalog_path)) + newline
     provider = ''.join(newline.join(('[model_providers.' + _quote(provider_id) + ']',
@@ -294,6 +296,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
         if profile['model']:
             value.pop('model', None)
         value.pop('model_reasoning_effort', None)
+        value.pop('conversationDetailMode', None)
         if catalog_path is not None:
             value.pop('model_catalog_json', None)
         agents = dict(value.get('agents', {}))

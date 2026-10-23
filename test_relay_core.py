@@ -22,6 +22,7 @@ class GlobalRelayConfigTests(unittest.TestCase):
         original = b'''# keep this comment
 model_provider = "relay_switcher"
 model = "old-model"
+conversationDetailMode = "OLD_MODE"
 openai_base_url = "http://127.0.0.1:57321/v1"
 [model_providers.custom]
 name = "old relay"
@@ -48,6 +49,7 @@ command = "example-tool"
         self.assertEqual(after['model_provider'], 'relay_switcher')
         self.assertEqual(after['model'], 'test-model')
         self.assertEqual(after['model_reasoning_effort'], 'high')
+        self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
         self.assertEqual(after['agents'], dict(max_threads=4, default_subagent_reasoning_effort='max'))
         for provider_id in ('custom', 'relay_switcher'):
             self.assertEqual(after['model_providers'][provider_id], dict(
@@ -90,9 +92,14 @@ base_url = "https://other.example/v1"
                 after = _parse(_new_config(b'', profile, 'catalog.json'))
                 self.assertEqual(after['model_reasoning_effort'], 'low' if effort == 'light' else effort)
                 self.assertEqual(after['model_catalog_json'], 'catalog.json')
+                self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
                 self.assertEqual(after['agents']['default_subagent_reasoning_effort'], 'max')
         profile = {key: value for key, value in self.profile.items() if key != 'reasoning_effort'}
         self.assertEqual(_parse(_new_config(b'', profile))['model_reasoning_effort'], 'high')
+
+    def test_conversation_detail_mode_is_written_without_catalog(self):
+        after = _parse(_new_config(b'', self.profile))
+        self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
 
     def test_auto_review_model_is_saved_per_station_and_cleared_on_connection_change(self):
         with (TemporaryDirectory() as temporary,
