@@ -1,70 +1,140 @@
 # Codex Relay Switcher
 
-Windows GUI for switching Codex relay providers and global model defaults.
+**在 Windows 上通过图形界面切换 Codex 中转站、模型和思考强度，并独立管理生图接口。**
 
-## Features
+保存常用站点后，选择模型并点击应用即可更新配置，减少反复手改 `config.toml` 的操作。适合经常在主力站、备用站和不同模型之间切换的 Codex 用户。
 
-- Manage language and image relay profiles in two independent tabs.
-- Connect a separate text-to-image API through a local Codex MCP tool.
-- Save generated images to `D:\codex-\image` and return image content with its local path.
-- Fetch available models from a relay's `/models` endpoint.
-- Set the global Codex provider, model, model catalog, and default reasoning effort.
-- Choose an optional per-relay Auto Review model override from `/models` or enter a model ID manually.
-- Auto Review model selection is separate from Auto Review activation and the `/review` model setting.
-- Supported reasoning effort choices: `light`, `medium`, `high`, `xhigh`, `max`, `ultra`.
-- Default sub-agent reasoning effort is `max`.
-- Set `conversationDetailMode = "STEPS_COMMANDS"` for the current desktop client behavior.
-- Keep a rollback copy of the previous Codex configuration.
-- Protect saved relay profiles and rollback data with Windows DPAPI.
-- Keep runtime data under the Codex user directory instead of the program directory.
+A Windows GUI for switching Codex relay providers, model defaults, reasoning effort, and a separate text-to-image API.
 
-## Requirements
+本项目是个人维护的第三方工具，与 OpenAI 无隶属关系。
 
-- Windows
-- Python 3.11 or newer
-- A Codex installation with a user configuration directory
+## 界面预览
 
-The included launcher expects Python 3.13 at `%LocalAppData%\\Programs\\Python\\Python313\\pythonw.exe`. Run `relay_switcher.pyw` directly with another supported Python installation if that path is different.
+### 语言模型中转
 
-## Usage
+集中管理站点、默认模型、默认思考强度和 Auto Review 模型。
 
-Run `启动中转站.bat`, or run:
+![语言模型中转界面：站点列表、模型选择与全局配置操作](docs/images/language-relay.png)
+
+### 生图中转
+
+使用独立的图片接口与密钥，切换当前生图模型，并控制是否允许新的生图请求。
+
+![生图中转界面：图片模型选择、启用开关与保存位置](docs/images/image-relay.png)
+
+> 截图使用演示站点和示例模型，不包含真实密钥。截图中的模型名称不代表任何中转站的可用性承诺。
+
+## 可以做什么
+
+| 功能 | 说明 |
+| --- | --- |
+| 保存多个中转站 | 保存名称、API 地址与密钥，随时选择、编辑和应用 |
+| 获取模型列表 | 读取站点的 `/models`，也支持手动输入模型 ID |
+| 切换全局配置 | 更新默认站点、模型和模型目录，并同步程序识别到的旧中转入口 |
+| 选择思考强度 | 提供 `light`、`medium`、`high`、`xhigh`、`max`、`ultra`；默认选择 `high`，子代理默认 `max` |
+| 指定 Auto Review 模型 | 为每个站点保存可选的审核模型，避免沿用该站点不支持的模型 ID |
+| 独立生图接口 | 语言模型与图片模型分开配置，通过本地 MCP 工具连接文字生图 API |
+| 生图即时开关 | 运行 Codex 时允许或阻止新的生图请求，图片保存到本地 |
+| 备份与恢复 | 语言模型配置应用前保留备份，可通过“恢复上次配置”回退 |
+
+## 快速开始
+
+### 运行条件
+
+- Windows，安装 Python 3.11 或更高版本，并能使用 Tkinter。
+- 已安装 Codex，并有可读取、写入的用户配置目录。
+- 自行准备中转站提供的 API 地址、密钥和可用模型。
+
+界面和 PNG 生图处理使用 Python 标准库，不需要额外安装界面框架。JPEG / WebP 图片的完整解码需要可选的 Pillow；程序不会自动安装依赖。
+
+### 下载并启动
+
+通过仓库页面的 **Code → Download ZIP** 下载并解压，或使用 Git：
 
 ```powershell
+git clone https://github.com/Oescat/codex-relay-switcher.git
+cd codex-relay-switcher
 python relay_switcher.pyw
 ```
 
-The default Codex home is `%USERPROFILE%\\.codex`. Set `CODEX_HOME` or use the GUI to select another configuration directory. Saved profiles, backups, and generated catalogs are stored below:
+下载 ZIP 的用户，在解压后的项目目录执行最后一行即可。启动前可用 `python --version` 检查 Python 版本。
+
+也可以双击 `启动中转站.bat`。该脚本目前固定查找下面的 Python 3.13 路径；如果你的安装位置不同，请使用上面的 Python 命令启动：
 
 ```text
-%USERPROFILE%\\.codex\\relay-switcher\\
+%LocalAppData%\Programs\Python\Python313\pythonw.exe
 ```
 
-After switching or restoring the global configuration, completely close and reopen Codex so the new configuration is loaded.
-Leave the Auto Review model blank to let Codex choose its default reviewer. A selected override is written to the relay model catalog for each model from that relay; the model ID must be supported by the relay. This does not enable Auto Review or configure the separate `/review` model.
+### 配置语言模型
 
-## Text-to-image setup
+1. 打开 **语言模型中转**，点击 **添加中转站**，填写名称、API 地址和 API Key。
+2. 点击 **获取模型**，选择默认模型；站点不提供模型列表时，可手动填写模型 ID。
+3. 保存站点，在主界面选择模型、默认思考强度，以及可选的 Auto Review 模型。
+4. 点击 **应用为全局中转站**，完全退出并重新打开 Codex，再使用已有或新对话。
 
-1. Open **生图中转** and add an image relay with its own API key. For Bajie, use `https://bajie-api.com/v1`.
-2. Fetch the model list or enter a model ID such as `gpt-image-2`. A relay's model list may also include language models; select one that supports `/images/generations`.
-3. Select **当前生图模型** and click **应用**, then completely exit and restart Codex after first registration. After first registration, change **当前生图模型** and click **应用** to use that model for the next request without restarting Codex. A request already submitted is unaffected. Keep the program folder in place: the MCP registration uses the absolute path to `relay_image_mcp.py` and the current Python executable.
-4. Explicitly ask Codex to generate an image. The tool description asks Codex to clarify ambiguous intent, display the returned image, and keep its local path. Actual tool discovery and image display must also be supported by the Codex client and the conversation model.
+**语言模型配置切换或恢复后，需要重开 Codex。** 已经运行的对话可能仍保留旧配置或连接。
 
-PNG output works with the standard library. JPEG and WebP results require the optional Pillow package for full decoding; if unavailable, those results are rejected without resending the generation request. No dependency is installed automatically.
+Auto Review 模型留空时由 Codex 默认选择；填写时，模型 ID 必须受所选站点支持。此设置通过站点模型目录应用到该站点的各个主模型，**不会启用 Auto Review，也不修改独立的 `/review` 模型设置**。
 
-All future images are saved to `D:\codex-\image`. The folder is created and checked for write access before sending a generation request. Each call generates one image; failures and timeouts are not automatically retried. The current integration supports text-to-image through OpenAI-compatible `/v1/images/generations`, using `prompt`, `size`, and `quality`. Image editing, video, and native Anthropic Messages adaptation are not included.
+### 配置文字生图
 
-Use **启用生图工具** in the Switcher to block or permit new requests while Codex is running. Closing the Switcher does not stop the MCP service. Turning the switch off cannot cancel a request already submitted. Changing the active relay's URL, key, or model turns generation off until you apply or enable it again. The tool remains registered while switched off and returns a disabled message without sending a generation request. Codex can still require approval under its own host policy; this program does not change global approval settings.
+1. 打开 **生图中转**，添加图片站点，填写其 API 根地址和独立的图片 API Key。
+2. 获取模型列表或手动输入图片模型 ID，确认该模型支持 `/images/generations`。
+3. 选择 **当前生图模型** 并点击 **应用**。首次注册 MCP 工具后，完全退出并重开 Codex。
+4. 在对话中明确提出生图请求，例如：“请生成一张白色背景的橘猫插画。”
 
-Image profiles and their independent key are encrypted with Windows DPAPI in `<CODEX_HOME>\relay-switcher\image-profiles.dpapi`. Only the local MCP command is added under `[mcp_servers.relay_switcher_image]`; the image key is not written into `config.toml`, command-line arguments, or environment variables. An encrypted initial MCP configuration backup is kept as `image-mcp-backup.dpapi`. An existing conflicting registration is reported without overwriting it.
+MCP 是让 Codex 调用外部工具的连接方式。本项目通过本地 MCP 服务提交生图请求，并返回图片内容与本地路径；实际工具发现、调用和图片预览仍依赖所用 Codex 客户端与对话模型的支持。
 
-## Security
+| 操作 | 是否需要重开 Codex |
+| --- | --- |
+| 首次注册生图 MCP 工具 | 需要 |
+| 更换当前生图模型并点击“应用” | 注册未变化时不需要，下次生图使用新模型 |
+| 更换图片站点或密钥并重新应用 | 注册未变化时不需要，下次请求使用新配置 |
+| 切换“启用生图工具” | 不需要，影响新的请求 |
 
-Do not commit `config.toml`, `auth.json`, API keys, DPAPI files, backups, or verification output. The repository ignore rules exclude these paths. The relay key is needed locally to query models and is written to the active Codex provider configuration by the current Codex integration; use a private repository and review the staged file list before publishing.
+图片目前统一保存到 **`D:\codex-\image`**，程序会在请求前创建目录并检查写入权限；请确保电脑有可用的 D 盘。每次调用生成一张图片，失败或超时不会自动重试。已经提交的请求不受后续切换影响，关闭开关无法撤销它们。
 
-## Tests
+修改当前生图站点的地址、密钥或模型会先关闭生图，需要重新应用或启用。关闭 Switcher 窗口不会停止 MCP 服务；关闭生图开关后，工具仍保留注册，但会拒绝新的生图请求。
+
+MCP 注册使用程序与 Python 的绝对路径。配置后请保留项目目录的位置；移动目录或更换 Python 后，应重新应用，并在注册发生变化时重开 Codex。
+
+## 配置与密钥保存在哪里
+
+默认配置目录为 `%USERPROFILE%\.codex`，也可以通过 `CODEX_HOME` 环境变量或界面中的 **更换配置目录** 指定。以下 `<CODEX_HOME>` 表示实际使用的配置目录。
+
+| 内容 | 位置与处理方式 |
+| --- | --- |
+| Codex 生效配置 | `<CODEX_HOME>\config.toml` |
+| 已保存的语言模型站点 | `<CODEX_HOME>\relay-switcher\profiles.dpapi`，Windows DPAPI 加密 |
+| 语言模型切换前的备份 | `<CODEX_HOME>\relay-switcher\backup.dpapi`，Windows DPAPI 加密 |
+| 图片站点、独立密钥与开关 | `<CODEX_HOME>\relay-switcher\image-profiles.dpapi`，Windows DPAPI 加密 |
+| 首次生图注册前的配置备份 | `<CODEX_HOME>\relay-switcher\image-mcp-backup.dpapi`，Windows DPAPI 加密 |
+| 生成的模型目录 | `<CODEX_HOME>\relay-switcher` 下 |
+| 生成图片 | `D:\codex-\image` |
+
+**站点存储加密不代表所有生效配置都加密。** 当前语言模型接入方式会将密钥写入 `config.toml` 的 provider 配置，必须保护该文件。图片密钥单独加密保存，不写入 `config.toml`、MCP 命令行或环境变量。
+
+获取模型列表和调用接口时，会向你选择的中转服务发送相应密钥；生图时还会发送提示词和生成参数。服务提供方的数据处理规则由其自身决定。
+
+不要把真实密钥、`config.toml`、`auth.json`、DPAPI 文件、备份或验证文件上传到公开仓库或附在 Issue 中。仓库已经配置相关忽略规则，分享前仍应检查文件；迁移到新电脑时应重新添加密钥，不要假定 DPAPI 文件可跨电脑解密。
+
+## 当前兼容范围
+
+- **语言模型：** 写入供 Codex 使用的 OpenAI Responses 兼容中转配置。模型目录可读取不等于所有模型都能稳定对话、调用工具或处理长上下文，需按所用站点实际验证。
+- **思考强度：** 界面中的 `light` 写入为 Codex 的 `low`；所选强度是否可用取决于模型和中转站支持情况。
+- **文字生图：** 使用 OpenAI 兼容的 `/v1/images/generations`，支持提示词、尺寸与画质参数；不包含图片编辑、视频或原生 Anthropic Messages 协议适配。
+- **桌面配置：** 语言模型应用时还会写入 `conversationDetailMode = "STEPS_COMMANDS"`。Codex 更新可能改变配置或模型目录的解释方式，请以所用客户端实际表现为准。
+- **审批：** 本项目不会修改 Codex 的全局审批策略。启用生图工具后，客户端仍可能要求审批。
+
+## 测试与反馈
+
+在项目目录运行：
 
 ```powershell
 python -m unittest -v
 ```
+
+测试覆盖全局配置、模型目录、生图配置与校验、MCP 注册与协议、以及界面操作。部分测试依赖 Windows DPAPI；测试使用合成凭据和模拟接口，不验证真实中转站的计费与可用性。
+
+遇到问题可以通过仓库的 **Issues** 反馈。请附 Windows、Python 和 Codex 版本、复现步骤及已脱敏的错误信息，切勿附上密钥或完整配置文件。
 
