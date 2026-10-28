@@ -54,11 +54,60 @@ class ImagePageTests(unittest.TestCase):
     def test_tabs_defaults_and_model_selection_are_independent(self):
         self.assertEqual([self.app.tabs.tab(item, 'text') for item in self.app.tabs.tabs()], ['语言模型中转', '生图中转'])
         self.assertEqual(self.app.selected_effort.get(), 'high')
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'max')
+        self.assertEqual(self.app.selected_subagent_model.get(), '')
+        self.assertEqual(tuple(self.app.subagent_effort_combo['values']), gui.REASONING_EFFORTS)
+        self.assertEqual(str(self.app.subagent_effort_combo['state']), 'disabled')
+        self.assertIn('OpenAI 官方模型能力目录', self.app.official_reasoning_status.get())
         self.assertEqual(self.app.selected_image_model.get(), 'image-model')
         self.assertIn('alternate-image-model', self.app.image_model_combo['values'])
         self.assertEqual(self.app.image_output_text.get(), '图片保存位置：' + gui.DEFAULT_OUTPUT_DIR)
         self.assertFalse(self.app.image_enabled.get())
         self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_subagent_selector_applies_and_preserves_independent_station_settings(self):
+        first = self.app.manager.save_profile(
+            'first language relay', 'https://first.example/v1', 'synthetic-language-key',
+            model='language-model')
+        second = self.app.manager.save_profile(
+            'second language relay', 'https://second.example/v1', 'synthetic-other-key',
+            model='language-model', subagent_reasoning_effort='medium')
+        self.app.refresh(first)
+        self.app.update()
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'max')
+        self.assertEqual(str(self.app.subagent_effort_combo['state']), 'readonly')
+        self.assertEqual(str(self.app.effort_combo['state']), 'readonly')
+        self.app.selected_subagent_model.set('child-model')
+        self.app.selected_subagent_effort.set('light')
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.app.switch()
+        self.errors.assert_not_called()
+        config = _parse(self.config.read_bytes())
+        self.assertEqual(config['model_reasoning_effort'], 'high')
+        self.assertEqual(config['agents']['default_subagent_reasoning_effort'], 'low')
+        self.assertEqual(config['agents']['default_subagent_model'], 'child-model')
+        self.assertEqual(config['mcp_servers'], _parse(self.original)['mcp_servers'])
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'light')
+        self.app.tree.selection_set(second)
+        self.app.update()
+        self.assertEqual(self.app.selected_subagent_model.get(), '')
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'medium')
+        self.app.tree.selection_set(first)
+        self.app.update()
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'light')
+        profile = self.app.manager.get_profile(first)
+        dialog = gui.ProfileDialog(self.app, self.app.manager, profile)
+        try:
+            dialog.save()
+            self.app.refresh(first)
+            self.assertEqual(self.app.selected_subagent_effort.get(), 'light')
+            self.assertEqual(self.app.manager.get_profile(first)['subagent_reasoning_effort'],
+                             'light')
+        finally:
+            profile.clear()
+            if dialog.winfo_exists():
+                dialog.destroy()
+        self.errors.assert_not_called()
 
     def test_apply_registers_only_image_tool_and_toggle_is_live(self):
         self.app.apply_image()

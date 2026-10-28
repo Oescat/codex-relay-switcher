@@ -12,7 +12,7 @@ A Windows GUI for switching Codex relay providers, model defaults, reasoning eff
 
 ### 语言模型中转
 
-集中管理站点、默认模型、默认思考强度和 Auto Review 模型。
+集中管理站点、默认模型、子代理模型与推理强度和 Auto Review 模型。
 
 ![语言模型中转界面：站点列表、模型选择与全局配置操作](docs/images/language-relay.png)
 
@@ -31,7 +31,7 @@ A Windows GUI for switching Codex relay providers, model defaults, reasoning eff
 | 保存多个中转站 | 保存名称、API 地址与密钥，随时选择、编辑和应用 |
 | 获取模型列表 | 读取站点的 `/models`，也支持手动输入模型 ID |
 | 切换全局配置 | 更新默认站点、模型和模型目录，并同步程序识别到的旧中转入口 |
-| 选择思考强度 | 提供 `light`、`medium`、`high`、`xhigh`、`max`、`ultra`；默认选择 `high`，子代理默认 `max` |
+| 选择思考强度 | 主模型与子代理分别选择 `light`、`medium`、`high`、`xhigh`、`max`、`ultra`；主模型默认 `high`，子代理默认 `max` |
 | 指定 Auto Review 模型 | 为每个站点保存可选的审核模型，避免沿用该站点不支持的模型 ID |
 | 独立生图接口 | 语言模型与图片模型分开配置，通过本地 MCP 工具连接文字生图 API |
 | 生图即时开关 | 运行 Codex 时允许或阻止新的生图请求，图片保存到本地 |
@@ -69,8 +69,12 @@ python relay_switcher.pyw
 
 1. 打开 **语言模型中转**，点击 **添加中转站**，填写名称、API 地址和 API Key。
 2. 点击 **获取模型**，选择默认模型；站点不提供模型列表时，可手动填写模型 ID。
-3. 保存站点，在主界面选择模型、默认思考强度，以及可选的 Auto Review 模型。
+3. 保存站点，在主界面选择模型、默认思考强度、**子代理模型**、**子代理推理强度**，以及可选的 Auto Review 模型。
 4. 点击 **应用为全局中转站**，完全退出并重新打开 Codex，再使用已有或新对话。
+
+子代理模型和推理强度随站点保存。子代理模型可从该站点的模型列表中选择，也可手动输入；留空让 Codex 自行选择。点击 **应用为全局中转站** 后，模型写入 `[agents].default_subagent_model`，强度写入 `[agents].default_subagent_reasoning_effort`。旧站点没有这些选项时，模型默认为空、强度默认为 `max`；首次导入已有配置时保留其中有效值。主模型的默认思考强度仍为 `high`，两者独立。界面中的 `light` 写入为 `low`。
+
+获取语言模型列表时，程序同时刷新 OpenAI 官方 Codex 模型目录并缓存在 `<CODEX_HOME>\relay-switcher\official_model_catalog.json`。应用中转站时按模型 ID 匹配官方能力，再依次使用已有 Codex 缓存和程序内置目录；官方目录不可用时保留已缓存版本。官方目录只说明 Codex 的模型能力，不保证第三方中转站实际支持相同接口或参数。
 
 **语言模型配置切换或恢复后，需要重开 Codex。** 已经运行的对话可能仍保留旧配置或连接。
 
@@ -109,6 +113,7 @@ MCP 注册使用程序与 Python 的绝对路径。配置后请保留项目目�
 | 语言模型切换前的备份 | `<CODEX_HOME>\relay-switcher\backup.dpapi`，Windows DPAPI 加密 |
 | 图片站点、独立密钥与开关 | `<CODEX_HOME>\relay-switcher\image-profiles.dpapi`，Windows DPAPI 加密 |
 | 首次生图注册前的配置备份 | `<CODEX_HOME>\relay-switcher\image-mcp-backup.dpapi`，Windows DPAPI 加密 |
+| OpenAI 官方 Codex 模型能力缓存 | `<CODEX_HOME>\relay-switcher\official_model_catalog.json`，获取语言模型时刷新 |
 | 生成的模型目录 | `<CODEX_HOME>\relay-switcher` 下 |
 | 生成图片 | `D:\codex-\image` |
 

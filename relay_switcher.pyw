@@ -12,6 +12,7 @@ from relay_core import REASONING_EFFORTS, RelayError, RelayManager, resolve_home
 from relay_images import DEFAULT_OUTPUT_DIR, ImageRelayManager, _normalize_base_url
 from relay_image_mcp import register_mcp
 from relay_models import fetch_model_catalog
+from relay_catalog import refresh_official_model_catalog
 
 
 BG = "#f3f5f9"
@@ -24,19 +25,29 @@ LINE = "#e1e6ef"
 
 class ModelRequest:
     """Keep HTTP requests off the Tk thread and deliver results only while open."""
-    def __init__(self, owner, base_url, api_key, on_success, on_error):
+    def __init__(self, owner, base_url, api_key, on_success, on_error,
+                 official_catalog_path=None):
         self.owner = owner
         self.on_success = on_success
         self.on_error = on_error
         self.result = queue.Queue(maxsize=1)
         self.pending = None
         self.closed = False
+        self.official_catalog_count = None
+        self.official_catalog_error = False
         self.destroy_binding = owner.bind("<Destroy>", self.on_destroy, add="+")
-        threading.Thread(target=ModelRequest.work, args=(self.result, base_url, api_key), daemon=True).start()
+        threading.Thread(target=ModelRequest.work,
+                         args=(self.result, base_url, api_key, official_catalog_path, self),
+                         daemon=True).start()
         self.pending = owner.after(80, self.poll)
 
     @staticmethod
-    def work(result_queue, base_url, api_key):
+    def work(result_queue, base_url, api_key, official_catalog_path=None, request=None):
+        if official_catalog_path is not None:
+            try:
+                request.official_catalog_count = refresh_official_model_catalog(official_catalog_path)
+            except RelayError:
+                request.official_catalog_error = True
         try:
             result_queue.put((True, fetch_model_catalog(base_url, api_key)))
         except Exception as exc:
@@ -204,7 +215,8 @@ class ProfileDialog(tk.Toplevel):
         self.fetching = True
         self.fetch_button.configure(state="disabled", text="获取中…")
         self.save_button.configure(state="disabled")
-        self.model_status.set("正在向此站点获取模型列表…")
+        self.model_status.set("正在获取模型列表和 OpenAI 官方模型能力目录…" if not self.image else
+                              "正在向此站点获取模型列表…")
 
         def finish(catalog=None, error=None):
             self.fetching = False
@@ -219,6 +231,13 @@ class ProfileDialog(tk.Toplevel):
                                       "获取失败，可重试或手动填写默认模型。")
                 show_error(self, error)
                 return
+            if not self.image:
+                request = self.model_request
+                if request.official_catalog_count is not None:
+                    self.model_status.set(
+                        f"已获取 {len(catalog.models)} 个模型，并同步 {request.official_catalog_count} 条官方能力。")
+                elif request.official_catalog_error:
+                    self.model_status.set("站点模型已获取；官方目录刷新失败，将使用已缓存或内置能力。")
             normalized = catalog.base_url != base_url
             if normalized:
                 self.vars["base_url"].set(catalog.base_url)
@@ -229,25 +248,38 @@ class ProfileDialog(tk.Toplevel):
                 self.model_status.set(f"已获取 {len(self.models)} 个模型，请选择图片模型。" +
                                       ("已更新为有效 API 地址。" if normalized else "仅保存在图片配置中。"))
             else:
-                self.model_status.set(f"已获取 {len(self.models)} 个模型，请选择默认模型。" +
-                                      ("已更新为有效 API 地址。" if normalized else "切换后全部写入 Codex。"))
+                suffix = (f"已同步 {self.model_request.official_catalog_count} 条官方能力。"
+                          if self.model_request.official_catalog_count is not None else
+                          "官方目录刷新失败，将使用已缓存或内置能力。"
+                          if self.model_request.official_catalog_error else "")
+                self.model_status.set(f"已获取 {len(self.models)} 个模型，请选择默认模型。{suffix}" +
+                                      ("已更新为有效 API 地址。" if normalized else "切换后写入 Codex。"))
 
-        self.model_request = ModelRequest(self, base_url, api_key,
-                                         lambda catalog: finish(catalog=catalog), lambda error: finish(error=error))
+        request_options = {} if self.image else {
+            "official_catalog_path": self.manager.home / "relay-switcher" / "official_model_catalog.json"}
+        self.model_request = ModelRequest(
+            self, base_url, api_key, lambda catalog: finish(catalog=catalog),
+            lambda error: finish(error=error), **request_options)
 
     def save(self):
         if self.fetching:
             return
         try:
-            self.saved_id = self.manager.save_profile(
+            values = dict(
                 name=self.vars["name"].get(),
                 base_url=self.vars["base_url"].get(),
                 api_key=self.vars["api_key"].get(),
                 model=self.vars["model"].get(),
                 profile_id=self.profile.get("id"),
                 models=self.models if self.model_catalog_changed else None,
-                reasoning_effort=self.profile.get("reasoning_effort", "high"),
             )
+            if not self.image:
+                values.update(
+                    reasoning_effort=self.profile.get("reasoning_effort", "high"),
+                    subagent_reasoning_effort=self.profile.get("subagent_reasoning_effort", "max"),
+                    subagent_model=self.profile.get("subagent_model", ""),
+                )
+            self.saved_id = self.manager.save_profile(**values)
         except Exception as exc:
             show_error(self, exc)
             return
@@ -433,20 +465,48 @@ class Switcher(tk.Tk):
         self.effort_combo.grid(row=1, column=1, sticky="ew", padx=(16, 0))
         self.fetch_button = ttk.Button(model_controls, text="获取模型", command=self.fetch)
         self.fetch_button.grid(row=1, column=2, padx=(12, 0))
+
+        reasoning_controls = ttk.Frame(model_controls, style="Surface.TFrame")
+        reasoning_controls.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        reasoning_controls.columnconfigure(1, weight=1)
+        ttk.Label(reasoning_controls, text="推理强度来源", style="SurfaceField.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 10))
+        self.official_reasoning_status = tk.StringVar(value="获取模型时同步 OpenAI 官方模型能力目录")
+        ttk.Label(reasoning_controls, textvariable=self.official_reasoning_status,
+                  style="SurfaceMuted.TLabel").grid(row=0, column=1, columnspan=2, sticky="w")
+
+        subagent_controls = ttk.Frame(model_controls, style="Surface.TFrame")
+        subagent_controls.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        subagent_controls.columnconfigure(0, weight=1)
+        ttk.Label(subagent_controls, text="子代理模型", style="SurfaceField.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(subagent_controls, text="子代理推理强度", style="SurfaceField.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(16, 0), pady=(0, 6))
+        self.selected_subagent_model = tk.StringVar(value="")
+        self.subagent_model_combo = ttk.Combobox(
+            subagent_controls, textvariable=self.selected_subagent_model, width=18)
+        self.subagent_model_combo.grid(row=1, column=0, sticky="ew")
+        self.selected_subagent_effort = tk.StringVar(value="max")
+        self.subagent_effort_combo = ttk.Combobox(
+            subagent_controls, textvariable=self.selected_subagent_effort,
+            width=9, state="readonly", values=REASONING_EFFORTS)
+        self.subagent_effort_combo.grid(row=1, column=1, sticky="ew", padx=(16, 0))
+        ttk.Label(subagent_controls, text="留空让 Codex 自行选择", style="SurfaceMuted.TLabel").grid(
+            row=1, column=2, sticky="w", padx=(12, 0))
+
         review_controls = ttk.Frame(model_controls, style="Surface.TFrame")
-        review_controls.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        review_controls.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         review_controls.columnconfigure(1, weight=1)
         ttk.Label(review_controls, text="Auto Review 模型", style="SurfaceField.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 12))
         self.selected_review_model = tk.StringVar()
         self.review_model_combo = ttk.Combobox(
-            review_controls, textvariable=self.selected_review_model, width=14
-        )
+            review_controls, textvariable=self.selected_review_model, width=14)
         self.review_model_combo.grid(row=0, column=1, sticky="ew")
         ttk.Label(review_controls, text="留空使用默认 reviewer", style="SurfaceMuted.TLabel").grid(
             row=0, column=2, padx=(12, 0))
         controls = ttk.Frame(main)
-        controls.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        controls.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         self.edit_button = ttk.Button(controls, text="编辑", command=self.edit)
         self.edit_button.pack(side="left")
         self.delete_button = ttk.Button(controls, text="删除", style="Danger.TButton", command=self.delete)
@@ -456,14 +516,14 @@ class Switcher(tk.Tk):
         self.switch_button = ttk.Button(controls, text="应用为全局中转站", style="Accent.TButton",
                                         command=self.switch)
         self.switch_button.pack(side="right")
-        note = ttk.Label(main, text="应用后请完全退出并重开 Codex；全局默认设置与旧中转入口会同步更新。子代理默认 max，light 对应 low。\n"
+        note = ttk.Label(main, text="应用后请完全退出并重开 Codex；全局默认设置与旧中转入口会同步更新。子代理模型可留空，强度默认 max；light 对应 low。\n"
                          "Auto Review 模型用于此站点全部主模型；留空使用默认选择。此设置不会启用 Auto Review，也不影响 /review。",
                          style="Muted.TLabel")
-        note.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        note.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.wrap_label(note, main)
         self.status = tk.StringVar(value="选择站点和模型，点击“应用为全局中转站”。")
         status = ttk.Label(main, textvariable=self.status, style="Status.TLabel")
-        status.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        status.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         self.wrap_label(status, main, 24)
         footer = ttk.Frame(self, padding=(24, 12))
         footer.grid(row=1, column=0, sticky="ew")
@@ -742,18 +802,23 @@ class Switcher(tk.Tk):
         )
         self.fetch_button.configure(state="normal" if state == "normal" and not self.fetching else "disabled")
         self.model_combo.configure(state=state)
-        self.effort_combo.configure(state=state)
+        self.effort_combo.configure(state="readonly" if state == "normal" else state)
+        self.subagent_model_combo.configure(state=state)
+        self.subagent_effort_combo.configure(state="readonly" if state == "normal" else state)
         self.review_model_combo.configure(state=state)
         if selected != self.model_profile_id:
             self.model_profile_id = selected
             profile = self.profiles.get(selected, {})
             self.selected_model.set(profile.get("model", ""))
             self.selected_effort.set(profile.get("reasoning_effort", "high"))
+            self.selected_subagent_model.set(profile.get("subagent_model", ""))
+            self.selected_subagent_effort.set(profile.get("subagent_reasoning_effort", "max"))
             self.selected_review_model.set(profile.get(
                 "auto_review_model",
                 self.current_auto_review_model if selected == self.current_profile_id else ""
             ))
             self.model_combo.configure(values=profile.get("models", []))
+            self.subagent_model_combo.configure(values=profile.get("models", []))
             self.review_model_combo.configure(values=profile.get("models", []))
 
     def refresh(self, select=None):
@@ -794,7 +859,7 @@ class Switcher(tk.Tk):
         self.fetching = True
         self.fetch_button.configure(state="disabled", text="获取中…")
         self.update_selection()
-        self.status.set(f"正在获取“{station_name}”的模型列表…")
+        self.status.set(f"正在获取“{station_name}”的模型列表和官方模型能力…")
 
         def finish(catalog=None, error=None):
             self.fetching = False
@@ -802,6 +867,12 @@ class Switcher(tk.Tk):
             self.update_selection()
             if self.manager is not manager:
                 return
+            request = self.model_request
+            if request.official_catalog_count is not None:
+                self.official_reasoning_status.set(
+                    f"已同步 OpenAI 官方模型目录：{request.official_catalog_count} 个模型")
+            elif request.official_catalog_error:
+                self.official_reasoning_status.set("官方目录刷新失败，应用时使用已缓存或内置能力")
             if error is not None:
                 self.status.set(f"“{station_name}”获取失败，可重试或手动填写默认模型。")
                 show_error(self, error)
@@ -822,8 +893,10 @@ class Switcher(tk.Tk):
                 self.status.set("站点信息已变化，模型列表未保存，请重新获取。")
                 show_error(self, exc)
 
-        self.model_request = ModelRequest(self, base_url, api_key,
-                                         lambda catalog: finish(catalog=catalog), lambda error: finish(error=error))
+        self.model_request = ModelRequest(
+            self, base_url, api_key, lambda catalog: finish(catalog=catalog),
+            lambda error: finish(error=error),
+            official_catalog_path=manager.home / "relay-switcher" / "official_model_catalog.json")
 
     def add(self):
         if not self.manager:
@@ -876,7 +949,9 @@ class Switcher(tk.Tk):
             self.manager.save_profile(profile["name"], profile["base_url"], profile["api_key"],
                                       model=self.selected_model.get(), profile_id=profile_id,
                                       reasoning_effort=self.selected_effort.get(),
-                                      auto_review_model=self.selected_review_model.get())
+                                      auto_review_model=self.selected_review_model.get(),
+                                      subagent_reasoning_effort=self.selected_subagent_effort.get(),
+                                      subagent_model=self.selected_subagent_model.get())
             profile.clear()
             provider_ids = self.manager.switch(profile_id)
             name = self.profiles[profile_id]["name"]

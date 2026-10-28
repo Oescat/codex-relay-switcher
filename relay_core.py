@@ -31,10 +31,10 @@ def _reasoning_effort(value):
     return value
 
 
-def _stored_reasoning_effort(value):
+def _stored_reasoning_effort(value, default='high'):
     if value == 'low':
         return 'light'
-    return value if value in REASONING_EFFORTS else 'high'
+    return value if value in REASONING_EFFORTS else default
 
 
 def _safe(function):
@@ -235,6 +235,11 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
     text = original.decode('utf-8')
     newline = '\r\n' if '\r\n' in text else '\n'
     reasoning_effort = _reasoning_effort(profile.get('reasoning_effort', 'high'))
+    subagent_effort = _reasoning_effort(profile.get('subagent_reasoning_effort', 'max'))
+    subagent_model = _optional_subagent_model(profile.get('subagent_model', ''))
+    subagent_setting = 'default_subagent_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[subagent_effort]) + newline
+    subagent_model_setting = ('default_subagent_model = ' + _quote(subagent_model) + newline
+                              if subagent_model else '')
     table = ()
     retained = []
     agents_table_found = False
@@ -248,13 +253,16 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             if table == ('agents',):
                 agents_table_found = True
                 retained.append(statement)
-                retained.append('default_subagent_reasoning_effort = "max"' + newline)
+                retained.append(subagent_setting)
+                if subagent_model_setting:
+                    retained.append(subagent_model_setting)
                 continue
         if len(table) >= 2 and table[0] == 'model_providers' and table[1] in provider_ids:
             continue
         if table == ('agents',) and stripped and not stripped.startswith('#'):
             entry = tomllib.loads('[agents]' + newline + statement)
-            if 'default_subagent_reasoning_effort' in entry.get('agents', {}):
+            if ('default_subagent_reasoning_effort' in entry.get('agents', {})
+                    or 'default_subagent_model' in entry.get('agents', {})):
                 continue
         if not table and stripped and not stripped.startswith('#'):
             entry = tomllib.loads(statement)
@@ -269,7 +277,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
                 continue
         retained.append(statement)
     if not agents_table_found:
-        retained.extend(('[agents]' + newline, 'default_subagent_reasoning_effort = "max"' + newline))
+        retained.extend(('[agents]' + newline, subagent_setting, subagent_model_setting))
     prefix = 'model_provider = "relay_switcher"' + newline
     if profile['model']:
         prefix += 'model = ' + _quote(profile['model']) + newline
@@ -301,6 +309,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             value.pop('model_catalog_json', None)
         agents = dict(value.get('agents', {}))
         agents.pop('default_subagent_reasoning_effort', None)
+        agents.pop('default_subagent_model', None)
         if agents:
             value['agents'] = agents
         else:
@@ -365,6 +374,24 @@ def _optional_model(value):
     return _validate_models([value])[0] if value else ''
 
 
+def _optional_subagent_model(value):
+    """Validate an optional default sub-agent model ID."""
+    if not isinstance(value, str):
+        raise RelayError('子代理模型必须是文本。')
+    value = value.strip()
+    return _validate_models([value])[0] if value else ''
+
+
+def _stored_subagent_model(value):
+    """Normalize a model read from config; invalid values mean no override."""
+    if not isinstance(value, str):
+        return ''
+    try:
+        return _optional_subagent_model(value)
+    except RelayError:
+        return ''
+
+
 def _catalog_auto_review_model(home, config):
     """Read the current model's reviewer override without exposing catalog data."""
     catalog_value = config.get('model_catalog_json')
@@ -411,6 +438,8 @@ class RelayManager:
                     imported['id'] = uuid.uuid4().hex
                     imported['models'] = [imported['model']] if imported['model'] else []
                     imported['reasoning_effort'] = current['reasoning_effort']
+                    imported['subagent_reasoning_effort'] = current['subagent_reasoning_effort']
+                    imported['subagent_model'] = current['subagent_model']
                     imported['auto_review_model'] = current['auto_review_model']
                     profiles.append(imported)
                 self._save(profiles)
@@ -449,6 +478,8 @@ class RelayManager:
                     raise ValueError
                 profile['models'] = _validate_models(profile.get('models', []))
                 profile['reasoning_effort'] = _reasoning_effort(profile.get('reasoning_effort', 'high'))
+                profile['subagent_reasoning_effort'] = _reasoning_effort(profile.get('subagent_reasoning_effort', 'max'))
+                profile['subagent_model'] = _optional_subagent_model(profile.get('subagent_model', ''))
                 if 'auto_review_model' in profile:
                     profile['auto_review_model'] = _optional_model(profile['auto_review_model'])
             return result['profiles']
@@ -470,9 +501,14 @@ class RelayManager:
         if not isinstance(provider, dict):
             raise RelayError('当前 provider 格式无效。')
         default_url = config.get('openai_base_url', '') if provider_id == 'openai' else ''
+        agents = config.get('agents', {})
+        subagent_effort = agents.get('default_subagent_reasoning_effort', 'max') if isinstance(agents, dict) else 'max'
+        subagent_model = agents.get('default_subagent_model', '') if isinstance(agents, dict) else ''
         current = dict(name=provider.get('name', provider_id), base_url=provider.get('base_url', default_url),
                        model=config.get('model', ''),
                        reasoning_effort=_stored_reasoning_effort(config.get('model_reasoning_effort', 'high')),
+                       subagent_reasoning_effort=_stored_reasoning_effort(subagent_effort, default='max'),
+                       subagent_model=_stored_subagent_model(subagent_model),
                        auto_review_model=_catalog_auto_review_model(self.home, config))
         key = provider.get('experimental_bearer_token', '')
         if not key and isinstance(provider.get('env_key'), str):
@@ -517,7 +553,8 @@ class RelayManager:
 
     @_safe
     def save_profile(self, name, base_url, api_key, model='', profile_id=None, models=None,
-                     reasoning_effort=None, auto_review_model=None):
+                     reasoning_effort=None, auto_review_model=None, subagent_reasoning_effort=None,
+                     subagent_model=None):
         profile = _validate(name, base_url, api_key, model)
         new_models = _validate_models(models) if models is not None else None
         new_auto_review_model = _optional_model(auto_review_model) if auto_review_model is not None else None
@@ -531,6 +568,14 @@ class RelayManager:
             profile['reasoning_effort'] = _reasoning_effort(
                 reasoning_effort if reasoning_effort is not None else
                 previous.get('reasoning_effort', 'high') if previous is not None else 'high'
+            )
+            profile['subagent_reasoning_effort'] = _reasoning_effort(
+                subagent_reasoning_effort if subagent_reasoning_effort is not None else
+                previous.get('subagent_reasoning_effort', 'max') if previous is not None else 'max'
+            )
+            profile['subagent_model'] = _optional_subagent_model(
+                subagent_model if subagent_model is not None else
+                previous.get('subagent_model', '') if previous is not None else ''
             )
             if new_auto_review_model is not None:
                 profile['auto_review_model'] = new_auto_review_model
@@ -592,11 +637,16 @@ class RelayManager:
             if not isinstance(effective_model, str) or not effective_model.strip():
                 raise RelayError('请先选择或填写默认模型，再切换站点。')
             from relay_catalog import write_model_catalog
+            models = list(stored_profile.get('models', []))
+            if stored_profile.get('subagent_model'):
+                models = _validate_models(models + [stored_profile['subagent_model']])
             catalog_path = write_model_catalog(
-                self.home, parsed, stored_profile.get('models', []), effective_model,
+                self.home, parsed, models, effective_model,
                 auto_review_model=stored_profile.get('auto_review_model', '')
             )
             profile['reasoning_effort'] = stored_profile.get('reasoning_effort', 'high')
+            profile['subagent_reasoning_effort'] = stored_profile.get('subagent_reasoning_effort', 'max')
+            profile['subagent_model'] = stored_profile.get('subagent_model', '')
             provider_ids = _global_provider_ids(parsed, stored_profiles)
             result = _new_config(original, profile, catalog_path, provider_ids)
             backup = dict(version=1, existed=existed, original=base64.b64encode(original).decode('ascii'),

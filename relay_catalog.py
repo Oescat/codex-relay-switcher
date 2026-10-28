@@ -5,11 +5,33 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import urllib.request
 
 from relay_core import RelayError, _atomic, _validate_models
 
 MAX_CATALOG_BYTES = 10 * 1024 * 1024
 BUNDLED_CATALOG = Path(__file__).with_name('bundled_model_catalog.json')
+OFFICIAL_CATALOG_URL = 'https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json'
+
+
+def refresh_official_model_catalog(path: Path) -> int:
+    """Download and validate OpenAI Codex's public model metadata catalog."""
+    request = urllib.request.Request(
+        OFFICIAL_CATALOG_URL, headers={'User-Agent': 'Codex-Relay-Switcher'})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read(MAX_CATALOG_BYTES + 1)
+        if len(raw) > MAX_CATALOG_BYTES:
+            raise ValueError('catalog too large')
+        catalog = json.loads(raw.decode('utf-8-sig'))
+        if (not isinstance(catalog, dict) or not isinstance(catalog.get('models'), list)
+                or any(not isinstance(entry, dict) or not isinstance(entry.get('slug'), str)
+                       for entry in catalog['models'])):
+            raise ValueError('invalid model catalog')
+        _atomic(Path(path), raw)
+        return len(catalog['models'])
+    except Exception:
+        raise RelayError('无法刷新 OpenAI 官方 Codex 模型目录；保留已缓存目录，未修改全局配置。') from None
 
 
 def _read_models(path):
@@ -64,8 +86,9 @@ def _matches(path, models, optional=False):
         try:
             if len(matching) != 1:
                 raise RelayError('模型目录中存在重复名称，未修改 Codex 配置。')
-            _validate_entry(matching[0])
-            result[model] = copy.deepcopy(matching[0])
+            entry = copy.deepcopy(matching[0])
+            _validate_entry(entry)
+            result[model] = entry
         except RelayError:
             if not optional:
                 raise
@@ -137,7 +160,18 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
             source = Path(value).expanduser()
             if not source.is_absolute():
                 source = home / source
-            resolved.update(_matches(source, set(ordered)))
+            generated_catalogs = (home / 'relay-switcher' / 'catalogs').resolve()
+            try:
+                source_is_generated = source.resolve().is_relative_to(generated_catalogs)
+            except OSError:
+                source_is_generated = False
+            if not source_is_generated:
+                resolved.update(_matches(source, set(ordered)))
+        pending = set(ordered) - resolved.keys()
+        if pending:
+            official = home / 'relay-switcher' / 'official_model_catalog.json'
+            if official.exists():
+                resolved.update(_matches(official, pending, optional=True))
         pending = set(ordered) - resolved.keys()
         if pending:
             cache = home / 'models_cache.json'
