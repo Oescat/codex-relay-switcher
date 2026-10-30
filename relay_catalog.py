@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import urllib.request
 
-from relay_core import RelayError, _atomic, _validate_models
+from relay_core import REASONING_EFFORTS, RelayError, _atomic, _validate_models, _validated_model_effort
 
 MAX_CATALOG_BYTES = 10 * 1024 * 1024
 BUNDLED_CATALOG = Path(__file__).with_name('bundled_model_catalog.json')
@@ -60,6 +60,11 @@ def _validate_entry(entry):
     }
     if any(type(entry.get(key)) is not kind for key, kind in required.items()):
         raise RelayError('所选模型的目录信息不完整，未修改 Codex 配置。')
+    valid_efforts = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}
+    if any(not isinstance(item, dict) or not isinstance(item.get('effort'), str)
+           or item['effort'] not in valid_efforts
+           for item in entry['supported_reasoning_levels']):
+        raise RelayError('所选模型的推理强度目录无效，未修改 Codex 配置。')
     messages = entry.get('model_messages')
     template = messages.get('instructions_template') if isinstance(messages, dict) else None
     if not isinstance(entry.get('base_instructions'), str) and not isinstance(template, str):
@@ -127,8 +132,74 @@ def _fallback(model):
     }
 
 
+def _explicit_catalog_source(home, config):
+    if 'model_catalog_json' not in config:
+        return None
+    value = config['model_catalog_json']
+    if not isinstance(value, str) or not value.strip():
+        raise RelayError('现有模型目录路径无效，未修改 Codex 配置。')
+    source = Path(value).expanduser()
+    if not source.is_absolute():
+        source = home / source
+    source = source.resolve()
+    generated_catalogs = (home / 'relay-switcher' / 'catalogs').resolve()
+    if not source.is_relative_to(generated_catalogs):
+        return source
+    provenance = source.with_suffix('.source.json')
+    if not provenance.exists():
+        return None
+    try:
+        with provenance.open('rb') as stream:
+            raw = stream.read(8193)
+        value = json.loads(raw.decode('utf-8'))
+        if (len(raw) > 8192 or not isinstance(value, str) or not value.strip()
+                or any(ord(char) < 32 for char in value)):
+            raise ValueError
+        original = Path(value)
+        if not original.is_absolute() or original.resolve().is_relative_to(generated_catalogs):
+            raise ValueError
+        return original
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+        raise RelayError('模型目录的原始来源记录无效，未修改 Codex 配置。') from None
+
+
+def _resolve_models(home, config, models):
+    """Use one source precedence for menu validation and generated catalogs."""
+    home = Path(home).expanduser().resolve()
+    pending = set(models)
+    resolved = {}
+    source = _explicit_catalog_source(home, config)
+    if source is not None:
+        resolved.update(_matches(source, pending))
+    sources = (home / 'relay-switcher' / 'official_model_catalog.json',
+               home / 'models_cache.json', BUNDLED_CATALOG)
+    for source in sources:
+        pending = set(models) - resolved.keys()
+        if pending and source.exists():
+            resolved.update(_matches(source, pending, optional=source != BUNDLED_CATALOG))
+    return resolved
+
+
+def reasoning_options(home, config, model):
+    """Read local capability metadata only; unknown and known-empty differ."""
+    entry = _resolve_models(home, config, [model]).get(model) if model else None
+    return _entry_reasoning_options(entry)
+
+
+def _entry_reasoning_options(entry):
+    if entry is None:
+        return dict(known=False, values=REASONING_EFFORTS, default=None)
+    values = tuple(dict.fromkeys('light' if item['effort'] == 'low' else item['effort']
+                                 for item in entry['supported_reasoning_levels']))
+    if not values:
+        return dict(known=True, values=('auto',), default='auto')
+    default = entry.get('default_reasoning_level')
+    default = 'light' if default == 'low' else default
+    return dict(known=True, values=values, default=default if default in values else values[0])
+
+
 def write_model_catalog(home: Path, config: dict, models: list[str], default_model: str,
-                        auto_review_model: str = '') -> Path:
+                        auto_review_model: str = '', reasoning_efforts=()) -> Path:
     """Expose all fetched IDs and mark the chosen model as Codex's default.
 
     Explicit user catalogs are required to be readable. The optional Codex cache
@@ -152,34 +223,9 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
         fetched = _validate_models(models)
         ordered = [default_model] + [model for model in fetched if model != default_model]
         home = Path(home).expanduser().resolve()
-        resolved = {}
-        if 'model_catalog_json' in config:
-            value = config['model_catalog_json']
-            if not isinstance(value, str) or not value.strip():
-                raise RelayError('现有模型目录路径无效，未修改 Codex 配置。')
-            source = Path(value).expanduser()
-            if not source.is_absolute():
-                source = home / source
-            generated_catalogs = (home / 'relay-switcher' / 'catalogs').resolve()
-            try:
-                source_is_generated = source.resolve().is_relative_to(generated_catalogs)
-            except OSError:
-                source_is_generated = False
-            if not source_is_generated:
-                resolved.update(_matches(source, set(ordered)))
-        pending = set(ordered) - resolved.keys()
-        if pending:
-            official = home / 'relay-switcher' / 'official_model_catalog.json'
-            if official.exists():
-                resolved.update(_matches(official, pending, optional=True))
-        pending = set(ordered) - resolved.keys()
-        if pending:
-            cache = home / 'models_cache.json'
-            if cache.exists():
-                resolved.update(_matches(cache, pending, optional=True))
-        pending = set(ordered) - resolved.keys()
-        if pending:
-            resolved.update(_matches(BUNDLED_CATALOG, pending))
+        resolved = _resolve_models(home, config, ordered)
+        for model, effort in reasoning_efforts:
+            _validated_model_effort(_entry_reasoning_options(resolved.get(model)), effort, model)
         entries = []
         for priority, model in enumerate(ordered):
             entry = resolved.get(model) or _fallback(model)
@@ -193,8 +239,17 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
                           indent=2, allow_nan=False) + '\n').encode('utf-8')
         if len(raw) > MAX_CATALOG_BYTES:
             raise RelayError('模型目录过大，未修改 Codex 配置。')
-        digest = hashlib.sha256(raw).hexdigest()
+        source = _explicit_catalog_source(home, config)
+        provenance = (json.dumps(str(source), ensure_ascii=False) + '\n').encode('utf-8') if source else b''
+        digest = hashlib.sha256(raw + (b'\0' + provenance if provenance else b'')).hexdigest()
         target = home / 'relay-switcher' / 'catalogs' / (digest + '.json')
+        if provenance:
+            source_record = target.with_suffix('.source.json')
+            if source_record.exists():
+                if source_record.read_bytes() != provenance:
+                    raise RelayError('模型目录的原始来源记录已被修改，未修改 Codex 配置。')
+            else:
+                _atomic(source_record, provenance)
         if target.exists():
             if target.read_bytes() != raw:
                 raise RelayError('已生成的模型目录被修改，请先检查该文件；Codex 配置未改动。')

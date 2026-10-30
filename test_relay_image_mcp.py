@@ -89,6 +89,74 @@ class MCPRegistrationTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse((self.home / 'relay-switcher' / 'image-mcp-backup.dpapi').exists())
 
+    def test_own_registration_preserves_added_settings_and_custom_timeout(self):
+        self.register()
+        config = self.home / 'config.toml'
+        original = config.read_bytes().replace(b'enabled = true', b'enabled = false')
+        original = original.replace(b'tool_timeout_sec = 300', b'tool_timeout_sec = 450')
+        original += (
+            b'# keep client settings\nenabled_tools = ["generate_image"]\n'
+            b'[mcp_servers.relay_switcher_image.env]\nEXAMPLE = "synthetic"\n'
+        )
+        config.write_bytes(original)
+        self.assertTrue(self.register()['changed'])
+        entry = _parse(config.read_bytes())['mcp_servers'][mcp.SERVER_NAME]
+        self.assertTrue(entry['enabled'])
+        self.assertEqual(entry['tool_timeout_sec'], 450)
+        self.assertEqual(entry['enabled_tools'], ['generate_image'])
+        self.assertEqual(entry['env'], {'EXAMPLE': 'synthetic'})
+        self.assertIn(b'# keep client settings', config.read_bytes())
+        self.assertFalse(self.register()['changed'])
+
+    def test_own_registration_can_update_python_and_moved_script_paths(self):
+        self.register()
+        config = self.home / 'config.toml'
+        before = _parse(config.read_bytes())
+        backup = self.home / 'relay-switcher' / 'image-mcp-backup.dpapi'
+        original_backup = backup.read_bytes()
+        moved = self.root / 'new location'
+        moved.mkdir()
+        script = moved / self.script.name
+        script.write_text('# moved synthetic service\n', encoding='utf-8')
+        python = moved / self.python.name
+        python.write_text('', encoding='utf-8')
+        self.assertTrue(mcp.register_mcp(self.home, script, python)['changed'])
+        after = _parse(config.read_bytes())
+        entry = after['mcp_servers'][mcp.SERVER_NAME]
+        self.assertEqual(entry['command'], str(python))
+        self.assertEqual(entry['args'], [str(script), '--home', str(self.home)])
+        self.assertEqual(mcp._without_managed_server(before), mcp._without_managed_server(after))
+        self.assertEqual(backup.read_bytes(), original_backup)
+
+    def test_own_registration_with_missing_defaults_can_be_upgraded(self):
+        self.register()
+        config = self.home / 'config.toml'
+        original = config.read_bytes().replace(b'enabled = true\n', b'')
+        original = original.replace(b'tool_timeout_sec = 300\n', b'')
+        config.write_bytes(original)
+        self.assertTrue(self.register()['changed'])
+        entry = _parse(config.read_bytes())['mcp_servers'][mcp.SERVER_NAME]
+        self.assertTrue(entry['enabled'])
+        self.assertEqual(entry['tool_timeout_sec'], 300)
+        self.assertFalse(self.register()['changed'])
+
+    def test_similar_registration_with_other_home_or_script_is_not_overwritten(self):
+        self.register()
+        config = self.home / 'config.toml'
+        registered = config.read_text(encoding='utf-8')
+        for old, new in (
+            (str(self.home), str(self.root / 'another-home')),
+            (str(self.script), str(self.root / 'other_service.py')),
+            (str(self.python), str(self.root / 'other-tool.exe')),
+        ):
+            with self.subTest(changed=Path(old).name):
+                original = registered.replace(json.dumps(old), json.dumps(new)).encode('utf-8')
+                self.assertNotEqual(original, registered.encode('utf-8'))
+                config.write_bytes(original)
+                with self.assertRaises(RelayError):
+                    self.register()
+                self.assertEqual(config.read_bytes(), original)
+
     def test_concurrent_config_change_fails_closed_and_restores_backup(self):
         config = self.home / 'config.toml'
         backup = self.home / 'relay-switcher' / 'image-mcp-backup.dpapi'
@@ -148,8 +216,8 @@ class MCPProtocolTests(unittest.TestCase):
             self.manager_calls.append((home, manager))
             return manager
 
-        def generator(manager, prompt, *, size, quality):
-            self.generator_calls.append((manager, prompt, size, quality))
+        def generator(manager, prompt, *, size, quality, **options):
+            self.generator_calls.append((manager, prompt, size, quality, options))
             return {
                 'path': self.saved, 'mime_type': 'image/png', 'width': 1254,
                 'height': 1254, 'data': self.image, 'model': 'test-image-model',
@@ -174,9 +242,18 @@ class MCPProtocolTests(unittest.TestCase):
         self.assertEqual(responses[1]['result'], {})
         tool = responses[2]['result']['tools'][0]
         self.assertEqual(tool['name'], 'generate_image')
-        self.assertIn('explicitly asks to generate an image', tool['description'])
+        self.assertIn('explicitly asks to generate an image or edit an image', tool['description'])
         self.assertEqual(tool['inputSchema']['required'], ['prompt'])
         self.assertNotIn('n', tool['inputSchema']['properties'])
+        properties = tool['inputSchema']['properties']
+        self.assertEqual(properties['input_images']['type'], 'array')
+        self.assertEqual(properties['mask']['type'], 'string')
+        self.assertEqual(properties['model']['type'], 'string')
+        self.assertNotIn('default', properties['size'])
+        self.assertNotIn('default', properties['quality'])
+        self.assertIn('Canva', tool['description'])
+        self.assertIn('never automatically', tool['description'])
+        self.assertIn('image-edit requests', responses[0]['result']['instructions'])
 
     def test_malformed_message_does_not_stop_following_requests(self):
         output = io.StringIO()
@@ -205,7 +282,25 @@ class MCPProtocolTests(unittest.TestCase):
         self.assertEqual(result['content'][1]['mimeType'], 'image/png')
         self.assertEqual(result['structuredContent']['width'], 1254)
         self.assertIn('![生成的图片](<D:/codex-/image/test image.png>)', result['content'][0]['text'])
-        self.assertEqual(self.generator_calls[0][1:], ('A test image', '1024x1024', 'low'))
+        self.assertEqual(self.generator_calls[0][1:4], ('A test image', None, None))
+        self.assertEqual(self.generator_calls[0][4], {})
+
+    def test_call_forwards_explicit_edit_inputs_and_per_call_options(self):
+        result = self.server.handle({
+            'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call',
+            'params': {'name': 'generate_image', 'arguments': {
+                'prompt': 'Edit the supplied image', 'input_images': ['D:/reference.png'],
+                'mask': 'D:/mask.png', 'model': 'cached-image-model',
+                'quality': 'xhigh', 'size': '2048x1024',
+            }},
+        })['result']
+        self.assertFalse(result['isError'])
+        self.assertEqual(self.generator_calls[0][1:4],
+                         ('Edit the supplied image', '2048x1024', 'xhigh'))
+        self.assertEqual(self.generator_calls[0][4], {
+            'input_images': ['D:/reference.png'], 'mask': 'D:/mask.png',
+            'model': 'cached-image-model',
+        })
 
     def test_each_call_reloads_manager_so_enable_switch_is_live(self):
         message = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
@@ -242,6 +337,37 @@ class MCPProtocolTests(unittest.TestCase):
         self.assertTrue(result['isError'])
         self.assertEqual(self.manager_calls, [])
         self.assertEqual(self.generator_calls, [])
+
+    def test_invalid_edit_argument_shapes_never_call_backend(self):
+        for options in (
+                {'input_images': 'D:/reference.png'},
+                {'input_images': []},
+                {'input_images': ['relative.png']},
+                {'mask': 'D:/mask.png'},
+                {'input_images': ['D:/reference.png'], 'mask': 7},
+                {'model': []},
+                {'size': '9' * 5000 + 'x16'},
+        ):
+            with self.subTest(options=options):
+                result = self.server.handle({
+                    'jsonrpc': '2.0', 'id': 8, 'method': 'tools/call',
+                    'params': {'name': 'generate_image',
+                               'arguments': {'prompt': 'Edit', **options}},
+                })['result']
+                self.assertTrue(result['isError'])
+        self.assertEqual(self.manager_calls, [])
+        self.assertEqual(self.generator_calls, [])
+
+    def test_unverified_quality_values_and_bounded_custom_size_reach_backend(self):
+        for quality in ('xhigh', 'max'):
+            result = self.server.handle({
+                'jsonrpc': '2.0', 'id': 9, 'method': 'tools/call',
+                'params': {'name': 'generate_image',
+                           'arguments': {'prompt': 'one', 'quality': quality,
+                                         'size': '4096x4096'}},
+            })['result']
+            self.assertFalse(result['isError'])
+            self.assertEqual(self.generator_calls[-1][2:], ('4096x4096', quality, {}))
 
     def test_unexpected_backend_error_is_sanitized(self):
         def failing_generator(*args, **kwargs):
@@ -288,7 +414,6 @@ class AdditionalProtocolTests(unittest.TestCase):
                     result = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                                             'params': {'name': 'generate_image', 'arguments': arguments}})
                     self.assertTrue(result['result']['isError'])
-
 
 class MCPProcessTests(unittest.TestCase):
     def test_console_service_initializes_without_reading_user_config(self):

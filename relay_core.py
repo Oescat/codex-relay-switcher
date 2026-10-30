@@ -22,19 +22,33 @@ class RelayError(Exception):
 
 REASONING_EFFORTS = ('light', 'medium', 'high', 'xhigh', 'max', 'ultra')
 _CODEX_REASONING_EFFORTS = {'light': 'low', **{value: value for value in REASONING_EFFORTS[1:]}}
+_CODEX_REASONING_EFFORTS.update(none='none', minimal='minimal')
 _BUILTIN_PROVIDER_IDS = frozenset(('openai', 'ollama', 'lmstudio', 'amazon-bedrock'))
 
 
 def _reasoning_effort(value):
-    if value not in REASONING_EFFORTS:
-        raise RelayError('默认思考强度无效，请选择 light、medium、high、xhigh、max 或 ultra。')
+    if value not in (*_CODEX_REASONING_EFFORTS, 'auto'):
+        raise RelayError('默认思考强度无效，请选择当前模型支持的推理强度。')
     return value
 
 
 def _stored_reasoning_effort(value, default='high'):
     if value == 'low':
         return 'light'
-    return value if value in REASONING_EFFORTS else default
+    return value if value in (*_CODEX_REASONING_EFFORTS, 'auto') else default
+
+
+def _validated_model_effort(options, effort, model):
+    effort = _reasoning_effort(effort)
+    if options['known'] and effort not in options['values']:
+        raise RelayError(f'模型“{model}”不支持所选推理强度，请重新选择。')
+    return effort
+
+
+def _effort_history(value):
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise RelayError('模型推理强度记录无效，未修改配置。')
+    return {model: _reasoning_effort(effort) for model, effort in value.items()}
 
 
 def _safe(function):
@@ -237,7 +251,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
     reasoning_effort = _reasoning_effort(profile.get('reasoning_effort', 'high'))
     subagent_effort = _reasoning_effort(profile.get('subagent_reasoning_effort', 'max'))
     subagent_model = _optional_subagent_model(profile.get('subagent_model', ''))
-    subagent_setting = 'default_subagent_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[subagent_effort]) + newline
+    subagent_setting = ('default_subagent_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[subagent_effort]) + newline
+                        if subagent_effort != 'auto' else '')
     subagent_model_setting = ('default_subagent_model = ' + _quote(subagent_model) + newline
                               if subagent_model else '')
     table = ()
@@ -281,7 +296,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
     prefix = 'model_provider = "relay_switcher"' + newline
     if profile['model']:
         prefix += 'model = ' + _quote(profile['model']) + newline
-    prefix += 'model_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[reasoning_effort]) + newline
+    if reasoning_effort != 'auto':
+        prefix += 'model_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[reasoning_effort]) + newline
     prefix += 'conversationDetailMode = "STEPS_COMMANDS"' + newline
     if catalog_path is not None:
         prefix += 'model_catalog_json = ' + _quote(str(catalog_path)) + newline
@@ -480,6 +496,8 @@ class RelayManager:
                 profile['reasoning_effort'] = _reasoning_effort(profile.get('reasoning_effort', 'high'))
                 profile['subagent_reasoning_effort'] = _reasoning_effort(profile.get('subagent_reasoning_effort', 'max'))
                 profile['subagent_model'] = _optional_subagent_model(profile.get('subagent_model', ''))
+                for field in ('model_reasoning_efforts', 'subagent_model_reasoning_efforts'):
+                    profile[field] = _effort_history(profile.get(field, {}))
                 if 'auto_review_model' in profile:
                     profile['auto_review_model'] = _optional_model(profile['auto_review_model'])
             return result['profiles']
@@ -544,6 +562,12 @@ class RelayManager:
             return [{key: value for key, value in profile.items() if key != 'api_key'} for profile in self._load()]
 
     @_safe
+    def reasoning_options(self, model):
+        from relay_catalog import reasoning_options
+        with self._locked():
+            return reasoning_options(self.home, _parse(self._read()), model.strip())
+
+    @_safe
     def get_profile(self, profile_id):
         with self._locked():
             for profile in self._load():
@@ -554,7 +578,8 @@ class RelayManager:
     @_safe
     def save_profile(self, name, base_url, api_key, model='', profile_id=None, models=None,
                      reasoning_effort=None, auto_review_model=None, subagent_reasoning_effort=None,
-                     subagent_model=None):
+                     subagent_model=None, model_reasoning_efforts=None,
+                     subagent_model_reasoning_efforts=None):
         profile = _validate(name, base_url, api_key, model)
         new_models = _validate_models(models) if models is not None else None
         new_auto_review_model = _optional_model(auto_review_model) if auto_review_model is not None else None
@@ -565,18 +590,31 @@ class RelayManager:
                 raise RelayError('站点已被另一窗口删除，请刷新列表。')
             same_connection = (previous is not None and previous['base_url'] == profile['base_url']
                                and previous['api_key'] == profile['api_key'])
-            profile['reasoning_effort'] = _reasoning_effort(
-                reasoning_effort if reasoning_effort is not None else
-                previous.get('reasoning_effort', 'high') if previous is not None else 'high'
-            )
-            profile['subagent_reasoning_effort'] = _reasoning_effort(
-                subagent_reasoning_effort if subagent_reasoning_effort is not None else
-                previous.get('subagent_reasoning_effort', 'max') if previous is not None else 'max'
-            )
             profile['subagent_model'] = _optional_subagent_model(
                 subagent_model if subagent_model is not None else
                 previous.get('subagent_model', '') if previous is not None else ''
             )
+            from relay_catalog import reasoning_options
+            config = _parse(self._read())
+            for field, history_field, model_field, requested, preferred, edited_history in (
+                    ('reasoning_effort', 'model_reasoning_efforts', 'model', reasoning_effort,
+                     'high', model_reasoning_efforts),
+                    ('subagent_reasoning_effort', 'subagent_model_reasoning_efforts',
+                     'subagent_model', subagent_reasoning_effort, 'max', subagent_model_reasoning_efforts)):
+                history = dict(previous.get(history_field, {})) if same_connection else {}
+                if same_connection:
+                    history.setdefault(previous.get(model_field, ''), previous.get(field, preferred))
+                if edited_history is not None:
+                    history.update(_effort_history(edited_history))
+                model = profile[model_field]
+                effective_model = model or (config.get('model', '') if model_field == 'model' else '')
+                options = reasoning_options(self.home, config, effective_model)
+                effort = requested if requested is not None else history.get(model, preferred)
+                if requested is None and options['known'] and effort not in options['values']:
+                    effort = options['default']
+                profile[field] = _validated_model_effort(options, effort, effective_model)
+                history[model] = profile[field]
+                profile[history_field] = history
             if new_auto_review_model is not None:
                 profile['auto_review_model'] = new_auto_review_model
             elif same_connection and 'auto_review_model' in previous:
@@ -642,7 +680,10 @@ class RelayManager:
                 models = _validate_models(models + [stored_profile['subagent_model']])
             catalog_path = write_model_catalog(
                 self.home, parsed, models, effective_model,
-                auto_review_model=stored_profile.get('auto_review_model', '')
+                auto_review_model=stored_profile.get('auto_review_model', ''),
+                reasoning_efforts=((effective_model, stored_profile.get('reasoning_effort', 'high')),
+                                   (stored_profile.get('subagent_model', ''),
+                                    stored_profile.get('subagent_reasoning_effort', 'max')))
             )
             profile['reasoning_effort'] = stored_profile.get('reasoning_effort', 'high')
             profile['subagent_reasoning_effort'] = stored_profile.get('subagent_reasoning_effort', 'max')

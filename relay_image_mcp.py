@@ -13,31 +13,54 @@ import tomllib
 
 from relay_core import (RelayError, RelayManager, _atomic, _crypt, _parse, _quote,
                         _safe, _statements, _table_path)
+from relay_images import MAX_INPUT_IMAGES, validate_image_options
 
 
 SERVER_NAME = 'relay_switcher_image'
 _PROTOCOL_VERSIONS = ('2025-06-18', '2025-03-26', '2024-11-05')
-_SIZES = ('1024x1024', '1536x1024', '1024x1536', 'auto')
-_QUALITIES = ('low', 'medium', 'high', 'auto')
+_QUALITIES = ('low', 'medium', 'high', 'auto', 'xhigh', 'max')
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_MESSAGE_CHARS = 128 * 1024
 _TOOL = {
     'name': 'generate_image',
     'description': (
         'Generate one image from a text prompt using the separately configured image relay. '
-        'Call only when the user explicitly asks to generate an image. If intent is unclear, '
+        'Call only when the user explicitly asks to generate an image or edit an image. If intent is unclear, '
         'ask the user first. Never call automatically for ordinary chat. The service checks '
         'the Switcher image enable switch for every call, saves to its configured local folder, '
         'and returns image content plus an absolute file path. Display the returned image '
         'in the conversation using its Markdown path. A timed-out request must not be '
-        'automatically retried because it may already have been billed.'
+        'automatically retried because it may already have been billed. Reference edits accept '
+        'explicit absolute local PNG, JPEG, or WebP paths; Canva is a separate tool and its '
+        'assets are never automatically uploaded. quality xhigh/max are explicit relay requests '
+        'whose server support is unverified.'
     ),
     'inputSchema': {
         'type': 'object',
         'properties': {
             'prompt': {'type': 'string', 'minLength': 1, 'maxLength': 16000},
-            'size': {'type': 'string', 'enum': list(_SIZES), 'default': '1024x1024'},
-            'quality': {'type': 'string', 'enum': list(_QUALITIES), 'default': 'low'},
+            'size': {
+                'type': 'string',
+                'pattern': r'^(auto|[1-9][0-9]*x[1-9][0-9]*)$',
+                'description': 'auto or positive integer dimensions; each side <=4096 and total <=16777216 pixels.',
+            },
+            'quality': {
+                'type': 'string', 'enum': list(_QUALITIES),
+                'description': 'low/medium/high/auto; xhigh and max are explicit unverified relay pass-through values.',
+            },
+            'input_images': {
+                'type': 'array', 'minItems': 1, 'maxItems': MAX_INPUT_IMAGES,
+                'items': {'type': 'string'},
+                'description': 'Optional absolute local PNG, JPEG, or WebP paths supplied explicitly by the user.',
+            },
+            'mask': {
+                'type': 'string',
+                'description': 'Optional absolute local alpha PNG mask; only valid with one input image.',
+            },
+            'model': {
+                'type': 'string',
+                'description': 'Optional per-call override limited to the active or cached station models.',
+            },
         },
         'required': ['prompt'],
         'additionalProperties': False,
@@ -54,6 +77,17 @@ def _absolute_path(value, label):
     if not path.is_absolute():
         raise RelayError(label + '必须是绝对路径。')
     return path.resolve()
+
+
+def _validate_local_argument(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise RelayError(label + '必须是绝对本地路径。')
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise RelayError(label + '必须是绝对本地路径。')
+    if os.name == 'nt' and path.drive.startswith('\\\\'):
+        raise RelayError(label + '不能使用网络共享路径。')
+    return value
 
 
 def _console_python(python_path=None):
@@ -76,6 +110,25 @@ def _without_managed_server(config):
     return result
 
 
+def _is_own_registration(existing, entry):
+    if not isinstance(existing, dict) or 'url' in existing:
+        return False
+    command = existing.get('command')
+    args = existing.get('args')
+    if (not isinstance(command, str) or not Path(command).is_absolute()
+            or not isinstance(args, list) or len(args) != 3
+            or not all(isinstance(value, str) for value in args)
+            or args[1] != '--home'):
+        return False
+    python_names = {'python', 'python3', 'python.exe', 'python3.exe', 'pythonw.exe',
+                    Path(entry['command']).name.casefold()}
+    return (Path(command).name.casefold() in python_names
+            and Path(args[0]).is_absolute() and Path(args[2]).is_absolute()
+            and Path(args[0]).name.casefold() == Path(entry['args'][0]).name.casefold()
+            and os.path.normcase(os.path.normpath(args[2]))
+            == os.path.normcase(os.path.normpath(entry['args'][2])))
+
+
 def _registered_config(original, entry):
     before = _parse(original)
     servers = before.get('mcp_servers', {})
@@ -85,6 +138,7 @@ def _registered_config(original, entry):
     newline = '\r\n' if '\r\n' in text else '\n'
     table = ()
     retained = []
+    managed = []
     for statement in _statements(text):
         stripped = statement.lstrip(' \t\r\n')
         if stripped.startswith('['):
@@ -95,6 +149,7 @@ def _registered_config(original, entry):
             if stripped.startswith('[[') and table[:2] == ('mcp_servers', SERVER_NAME):
                 raise RelayError('图片 MCP 配置使用了数组表，未修改配置。')
         if table and table[:2] == ('mcp_servers', SERVER_NAME):
+            managed.append((table, statement))
             continue
         if stripped and not stripped.startswith(('#', '[')):
             try:
@@ -115,21 +170,44 @@ def _registered_config(original, entry):
     if existing == entry:
         return original
     if existing is not None:
-        raise RelayError('mcp_servers.relay_switcher_image 已被其他配置占用，未修改配置。')
+        if not _is_own_registration(existing, entry):
+            raise RelayError('mcp_servers.relay_switcher_image 指向其他程序或配置目录，未修改配置。')
+        updates = {key: entry[key] for key in ('enabled', 'command', 'args')}
+        if 'tool_timeout_sec' not in existing:
+            updates['tool_timeout_sec'] = entry['tool_timeout_sec']
+        expected = dict(existing, **updates)
+        if expected == existing:
+            return original
+        rewritten = []
+        for table, statement in managed:
+            stripped = statement.lstrip(' \t\r\n')
+            if table == ('mcp_servers', SERVER_NAME):
+                if stripped.startswith('['):
+                    rewritten.append(statement if statement.endswith('\n') else statement + newline)
+                    rewritten.extend(key + ' = ' + json.dumps(value, ensure_ascii=False) + newline
+                                     for key, value in updates.items())
+                    continue
+                if stripped and not stripped.startswith('#'):
+                    if set(tomllib.loads(statement)) & updates.keys():
+                        continue
+            rewritten.append(statement)
+        stanza = ''.join(rewritten)
+    else:
+        expected = entry
+        stanza = newline.join((
+            '[mcp_servers.' + SERVER_NAME + ']',
+            'enabled = true',
+            'command = ' + _quote(entry['command']),
+            'args = ' + json.dumps(entry['args'], ensure_ascii=False),
+            'tool_timeout_sec = 300',
+        )) + newline
     retained_text = ''.join(retained)
     if retained_text and not retained_text.endswith('\n'):
         retained_text += newline
-    stanza = newline.join((
-        '[mcp_servers.' + SERVER_NAME + ']',
-        'enabled = true',
-        'command = ' + _quote(entry['command']),
-        'args = ' + json.dumps(entry['args'], ensure_ascii=False),
-        'tool_timeout_sec = 300',
-    )) + newline
     result = (retained_text + newline + stanza).encode('utf-8')
     after = _parse(result)
     if (_without_managed_server(before) != _without_managed_server(after)
-            or after.get('mcp_servers', {}).get(SERVER_NAME) != entry):
+            or after.get('mcp_servers', {}).get(SERVER_NAME) != expected):
         raise RelayError('无法安全保留现有配置，未修改配置。')
     return result
 
@@ -194,15 +272,44 @@ class ImageMCPServer:
         return {'content': [{'type': 'text', 'text': message}], 'isError': True}
 
     def _generate(self, arguments):
-        if not isinstance(arguments, dict) or set(arguments) - {'prompt', 'size', 'quality'}:
-            return self._tool_error('生图参数无效；只允许 prompt、size 和 quality。')
+        allowed = {'prompt', 'size', 'quality', 'input_images', 'mask', 'model'}
+        if not isinstance(arguments, dict) or set(arguments) - allowed:
+            return self._tool_error('生图参数无效；请检查 prompt、size、quality、input_images、mask 和 model。')
         prompt = arguments.get('prompt')
-        size = arguments.get('size', '1024x1024')
-        quality = arguments.get('quality', 'low')
+        size = arguments.get('size')
+        quality = arguments.get('quality')
+        input_images = arguments.get('input_images')
+        mask = arguments.get('mask')
+        model = arguments.get('model')
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 16000 or '\x00' in prompt:
             return self._tool_error('请提供 1 至 16000 字符的有效文字生图提示词。')
-        if size not in _SIZES or quality not in _QUALITIES:
+        if size is not None and not isinstance(size, str):
             return self._tool_error('生图尺寸或质量参数无效。')
+        if quality is not None and (not isinstance(quality, str) or quality not in _QUALITIES):
+            return self._tool_error('生图尺寸或质量参数无效。')
+        if input_images is not None:
+            if (not isinstance(input_images, list) or not input_images
+                    or len(input_images) > MAX_INPUT_IMAGES):
+                return self._tool_error('input_images 必须包含 1 至 4 个绝对本地图片路径。')
+            try:
+                for path in input_images:
+                    _validate_local_argument(path, '参考图片路径')
+            except RelayError as error:
+                return self._tool_error(str(error))
+        if mask is not None:
+            try:
+                _validate_local_argument(mask, '遮罩路径')
+            except RelayError as error:
+                return self._tool_error(str(error))
+            if input_images is None or len(input_images) != 1:
+                return self._tool_error('遮罩仅支持与一张参考图片同时使用。')
+        if model is not None and (not isinstance(model, str) or not model.strip()
+                                  or any(ord(char) < 32 or ord(char) == 127 for char in model)):
+            return self._tool_error('model 必须是有效的模型 ID。')
+        try:
+            size, quality = validate_image_options(size, quality)
+        except RelayError as error:
+            return self._tool_error(str(error))
         try:
             # Keep unexpected backend diagnostics out of protocol and credential logs.
             with open(os.devnull, 'w', encoding='utf-8') as sink, redirect_stdout(sink), redirect_stderr(sink):
@@ -216,7 +323,14 @@ class ImageMCPServer:
                     generator = generate_image
                 else:
                     generator = self.generator
-                result = generator(manager, prompt.strip(), size=size, quality=quality)
+                options = {'size': size, 'quality': quality}
+                if input_images is not None:
+                    options['input_images'] = input_images
+                if mask is not None:
+                    options['mask'] = mask
+                if model is not None:
+                    options['model'] = model
+                result = generator(manager, prompt.strip(), **options)
             path = _absolute_path(result['path'], '图片保存路径')
             mime = result['mime_type']
             data = result['data']
@@ -263,8 +377,8 @@ class ImageMCPServer:
             requested = params.get('protocolVersion')
             version = requested if requested in _PROTOCOL_VERSIONS else _PROTOCOL_VERSIONS[0]
             result = {'protocolVersion': version, 'capabilities': {'tools': {'listChanged': False}},
-                      'serverInfo': {'name': SERVER_NAME, 'version': '1.0.0'},
-                      'instructions': 'Use generate_image only for explicit image-generation requests. Display returned images and local paths.'}
+                      'serverInfo': {'name': SERVER_NAME, 'version': '1.1.0'},
+                      'instructions': 'Use generate_image only for explicit image-generation or image-edit requests. Display returned images and local paths.'}
         elif method == 'ping':
             result = {}
         elif method == 'tools/list':

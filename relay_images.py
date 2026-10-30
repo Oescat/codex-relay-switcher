@@ -33,9 +33,46 @@ DEFAULT_OUTPUT_DIR = r"D:\codex-\image"
 _MAX_JSON_BYTES = 32 * 1024 * 1024
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_DIMENSION = 32768
+MAX_INPUT_IMAGES = 4
+_MAX_EDIT_INPUT_BYTES = 50 * 1024 * 1024
+_MAX_EDIT_DIMENSION = 4096
+_MAX_EDIT_PIXELS = 16_777_216
 _MODEL_ID = re.compile(r"^[^\s\x00-\x1f\x7f]+$")
-_QUALITY = frozenset(("low", "medium", "high", "auto"))
-_SIZE = frozenset(("auto", "1024x1024", "1024x1536", "1536x1024"))
+_QUALITY = frozenset(("low", "medium", "high", "auto", "xhigh", "max"))
+_SIZE_PATTERN = re.compile(r"^([1-9][0-9]*)x([1-9][0-9]*)$")
+_DEFAULT_QUALITY = "low"
+_DEFAULT_SIZE = "1024x1024"
+
+
+def _validate_quality(value):
+    if not isinstance(value, str) or value not in _QUALITY:
+        raise RelayError("图片画质无效；可选 low、medium、high、auto、xhigh 或 max。"
+                         " xhigh/max 仅作为显式中转请求，服务端是否支持未验证。")
+    return value
+
+
+def _validate_size(value):
+    if value == "auto":
+        return value
+    if not isinstance(value, str):
+        raise RelayError("图片尺寸无效；请使用 auto 或正整数 WxH。")
+    match = _SIZE_PATTERN.fullmatch(value)
+    if match is None:
+        raise RelayError("图片尺寸无效；请使用 auto 或正整数 WxH。")
+    if any(len(part) > 4 for part in match.groups()):
+        raise RelayError("图片尺寸超出限制；单边不超过 4096，像素总数不超过 16777216。")
+    width, height = (int(part) for part in match.groups())
+    if (width > _MAX_EDIT_DIMENSION or height > _MAX_EDIT_DIMENSION
+            or width * height > _MAX_EDIT_PIXELS):
+        raise RelayError("图片尺寸超出限制；单边不超过 4096，"
+                         "像素总数不超过 16777216。")
+    return value
+
+
+def validate_image_options(size, quality):
+    """Validate generic relay image options without claiming model capabilities."""
+    return (None if size is None else _validate_size(size),
+            None if quality is None else _validate_quality(quality))
 
 
 def _normalize_base_url(value):
@@ -87,6 +124,25 @@ def _validate_profile(name, base_url, api_key, model, require_key=True):
     return profile
 
 
+def _validate_model_settings(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 500:
+        raise RelayError("图片模型默认设置无效，未修改配置。")
+    result = {}
+    for model, options in value.items():
+        if (not isinstance(model, str) or len(model) > 2000 or not _MODEL_ID.fullmatch(model)
+                or not isinstance(options, dict) or set(options) - {"quality", "size"}):
+            raise RelayError("图片模型默认设置无效，未修改配置。")
+        try:
+            quality = _validate_quality(options.get("quality", _DEFAULT_QUALITY))
+            size = _validate_size(options.get("size", _DEFAULT_SIZE))
+        except RelayError:
+            raise RelayError("图片模型默认设置无效，未修改配置。") from None
+        result[model] = {"quality": quality, "size": size}
+    return result
+
+
 def _image_dimensions(data):
     """Validate a supported raster signature and return format plus dimensions."""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -96,6 +152,106 @@ def _image_dimensions(data):
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return _webp_dimensions(data)
     raise RelayError("生图接口返回的内容不是受支持的 PNG、JPEG 或 WebP 图片。")
+
+
+def _png_has_alpha(data):
+    offset = 8
+    color_type = None
+    has_transparency = False
+    while offset + 12 <= len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        kind = data[offset + 4:offset + 8]
+        chunk_data = data[offset + 8:offset + 8 + length]
+        if kind == b"IHDR":
+            color_type = chunk_data[9]
+        elif kind == b"tRNS":
+            has_transparency = True
+        elif kind == b"IEND":
+            break
+        offset += 12 + length
+    return color_type in (4, 6) or has_transparency
+
+
+def _read_edit_image(value, label):
+    if (not isinstance(value, str) or not value.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise RelayError(label + "必须是有效的绝对本地路径。")
+    path = Path(value)
+    if not path.is_absolute():
+        raise RelayError(label + "必须是绝对本地路径。")
+    try:
+        path = path.resolve(strict=True)
+        if os.name == "nt" and path.drive.startswith("\\\\"):
+            raise RelayError(label + "不能使用网络共享路径。")
+        if not path.is_file() or path.stat().st_size <= 0 or path.stat().st_size > _MAX_IMAGE_BYTES:
+            raise RelayError(label + "为空、不是普通文件或超过 25 MiB。")
+        with path.open("rb") as stream:
+            data = stream.read(_MAX_IMAGE_BYTES + 1)
+    except RelayError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise RelayError(label + "无法读取。") from None
+    if not data or len(data) > _MAX_IMAGE_BYTES:
+        raise RelayError(label + "为空或超过 25 MiB。")
+    try:
+        mime_type, width, height = _image_dimensions(data)
+    except RelayError as error:
+        raise RelayError(label + "无效：" + str(error)) from None
+    if (width > _MAX_EDIT_DIMENSION or height > _MAX_EDIT_DIMENSION
+            or width * height > _MAX_EDIT_PIXELS):
+        raise RelayError(label + "尺寸超出限制：单边最多 4096，像素总数最多 16777216。")
+    return {"data": data, "mime_type": mime_type, "width": width, "height": height}
+
+
+def _prepare_edit_inputs(input_images, mask):
+    if input_images is None:
+        if mask is not None:
+            raise RelayError("使用遮罩前必须提供一张参考图片。")
+        return None, None
+    if (not isinstance(input_images, (list, tuple)) or not input_images
+            or len(input_images) > MAX_INPUT_IMAGES):
+        raise RelayError("参考图片必须是 1 至 4 个绝对本地 PNG、JPEG 或 WebP 路径。")
+    if mask is not None and len(input_images) != 1:
+        raise RelayError("遮罩仅支持与一张参考图片同时使用。")
+    images = [_read_edit_image(path, "参考图片") for path in input_images]
+    total_bytes = sum(len(image["data"]) for image in images)
+    if total_bytes > _MAX_EDIT_INPUT_BYTES:
+        raise RelayError("参考图片总大小超过 50 MiB。")
+    checked_mask = None
+    if mask is not None:
+        checked_mask = _read_edit_image(mask, "遮罩图片")
+        total_bytes += len(checked_mask["data"])
+        if total_bytes > _MAX_EDIT_INPUT_BYTES:
+            raise RelayError("参考图片和遮罩总大小超过 50 MiB。")
+        if checked_mask["mime_type"] != "image/png" or not _png_has_alpha(checked_mask["data"]):
+            raise RelayError("遮罩必须是带 alpha 通道的 PNG 图片。")
+        if (checked_mask["width"], checked_mask["height"]) != (
+                images[0]["width"], images[0]["height"]):
+            raise RelayError("遮罩尺寸必须与参考图片完全一致。")
+    return images, checked_mask
+
+
+def _multipart_body(fields, images, mask):
+    boundary = "codex-relay-" + uuid.uuid4().hex
+    marker = boundary.encode("ascii")
+    chunks = []
+    for name, value in fields:
+        chunks.extend((b"--" + marker + b"\r\n",
+                       f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"),
+                       str(value).encode("utf-8"), b"\r\n"))
+    extensions = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    for index, image in enumerate(images, 1):
+        filename = f"reference-{index}.{extensions[image['mime_type']]}"
+        chunks.extend((b"--" + marker + b"\r\n",
+                       f'Content-Disposition: form-data; name="image[]"; filename="{filename}"\r\n'
+                       f'Content-Type: {image["mime_type"]}\r\n\r\n'.encode("ascii"),
+                       image["data"], b"\r\n"))
+    if mask is not None:
+        chunks.extend((b"--" + marker + b"\r\n",
+                       b'Content-Disposition: form-data; name="mask"; filename="mask.png"\r\n',
+                       b"Content-Type: image/png\r\n\r\n", mask["data"], b"\r\n"))
+    chunks.append(b"--" + marker + b"--\r\n")
+    return boundary, b"".join(chunks)
 
 
 def _checked_dimensions(width, height):
@@ -348,6 +504,7 @@ class ImageRelayManager:
                 profile["id"] = profile_id
                 profile["models"] = _validate_models(stored.get("models", []))
                 profile["reasoning_effort"] = _reasoning_effort(stored.get("reasoning_effort", "high"))
+                profile["model_settings"] = _validate_model_settings(stored.get("model_settings"))
                 cleaned.append(profile)
             if active_id is not None and active_id not in seen:
                 active_id = None
@@ -401,6 +558,7 @@ class ImageRelayManager:
             profile["reasoning_effort"] = _reasoning_effort(
                 reasoning_effort if reasoning_effort is not None else
                 previous.get("reasoning_effort", "high") if previous is not None else "high")
+            profile["model_settings"] = (previous["model_settings"] if same_connection else {})
             profiles = [item for item in profiles if item["id"] != profile["id"]]
             profiles.append(profile)
             if (settings["enabled"] and settings["active_id"] == profile["id"] and previous is not None
@@ -443,12 +601,18 @@ class ImageRelayManager:
             self._save(remaining, settings)
 
     @_safe
-    def apply(self, profile_id, model, output_dir):
+    def apply(self, profile_id, model, output_dir, quality=None, size=None, model_settings=None):
         if not isinstance(model, str):
             raise RelayError("图片模型 ID 必须是文本。")
         model = model.strip()
         if not model or not _MODEL_ID.fullmatch(model):
             raise RelayError("请先选择或填写有效的图片模型 ID。")
+        if quality is not None:
+            quality = _validate_quality(quality)
+        if size is not None:
+            size = _validate_size(size)
+        checked_model_settings = (_validate_model_settings(model_settings)
+                                  if model_settings is not None else None)
         output_dir = _output_path(output_dir)
         with self._locked():
             profiles, settings = self._load()
@@ -459,6 +623,16 @@ class ImageRelayManager:
             profile["model"] = model
             if model not in profile["models"]:
                 profile["models"].insert(0, model)
+            if checked_model_settings is not None:
+                profile["model_settings"].update(checked_model_settings)
+            options = dict(profile["model_settings"].get(
+                model, {"quality": _DEFAULT_QUALITY, "size": _DEFAULT_SIZE}))
+            if quality is not None or size is not None or checked_model_settings is not None:
+                if quality is not None:
+                    options["quality"] = quality
+                if size is not None:
+                    options["size"] = size
+                profile["model_settings"][model] = options
             settings["active_id"] = profile_id
             settings["output_dir"] = output_dir
             self._save(profiles, settings)
@@ -489,6 +663,9 @@ class ImageRelayManager:
                 raise RelayError("生图配置不完整；请在切换器中选择图片中转站、密钥和模型。")
             result = dict(profile)
             result["output_dir"] = settings["output_dir"]
+            options = profile["model_settings"].get(profile["model"], {})
+            result["default_quality"] = options.get("quality", _DEFAULT_QUALITY)
+            result["default_size"] = options.get("size", _DEFAULT_SIZE)
             return result
 
 
@@ -521,36 +698,61 @@ def _http_failure(error):
         400: "生图请求被拒绝（HTTP 400），请检查模型 ID、尺寸和画质参数。",
         401: "生图认证失败（HTTP 401），请检查独立的图片 API Key。",
         403: "生图访问被拒绝（HTTP 403），请检查密钥权限或模型访问权限。",
-        404: "生图 API 或模型不存在（HTTP 404），请检查 /v1/images/generations 地址和模型 ID。",
+        404: "生图 API 或模型不存在（HTTP 404），请检查 /v1/images/generations 或 /v1/images/edits 地址和模型 ID。",
         429: "生图额度不足或请求过于频繁（HTTP 429）；本程序未自动重试。",
     }
     return RelayError(messages.get(error.code,
                                    f"生图 API 请求失败（HTTP {error.code}）；本程序未自动重试。"))
 
 
-def generate_image(manager, prompt, size="1024x1024", quality="low"):
-    """Submit exactly one text-to-image request and save its validated result."""
+def generate_image(manager, prompt, size=None, quality=None, model=None,
+                   input_images=None, mask=None):
+    """Submit one generation or reference-edit request and save its validated result."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20000:
         raise RelayError("请提供 1 到 20000 个字符的生图提示词。")
     if any(ord(char) == 0 for char in prompt):
         raise RelayError("生图提示词不能包含 NUL 字符。")
-    if not isinstance(size, str) or size not in _SIZE:
-        raise RelayError("图片尺寸无效；可选 auto、1024x1024、1024x1536 或 1536x1024。")
-    if not isinstance(quality, str) or quality not in _QUALITY:
-        raise RelayError("图片画质无效；可选 low、medium、high 或 auto。")
     profile = manager.generation_profile()
+    if model is None:
+        request_model = profile["model"]
+    elif (not isinstance(model, str) or len(model) > 2000 or not _MODEL_ID.fullmatch(model)
+          or model != profile["model"] and model not in profile["models"]):
+        raise RelayError("图片模型覆盖值必须是当前模型或此中转站已缓存的模型。")
+    else:
+        request_model = model
+    model_options = profile["model_settings"].get(request_model, {})
+    if size is None:
+        size = (profile.get("default_size", _DEFAULT_SIZE)
+                if request_model == profile["model"]
+                else model_options.get("size", _DEFAULT_SIZE))
+    if quality is None:
+        quality = (profile.get("default_quality", _DEFAULT_QUALITY)
+                   if request_model == profile["model"]
+                   else model_options.get("quality", _DEFAULT_QUALITY))
+    size = _validate_size(size)
+    quality = _validate_quality(quality)
+    images, checked_mask = _prepare_edit_inputs(input_images, mask)
     output_dir = _check_output_dir(profile["output_dir"])
     base_url = _normalize_base_url(profile["base_url"])
-    endpoint = base_url + "/images/generations"
-    request_body = json.dumps({"model": profile["model"], "prompt": prompt.strip(),
-                               "size": size, "quality": quality, "n": 1},
-                              ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(endpoint, data=request_body,
-                                     headers={"Authorization": "Bearer " + profile["api_key"],
-                                              "Content-Type": "application/json",
-                                              "Accept": "application/json"}, method="POST")
+    if images is None:
+        endpoint = base_url + "/images/generations"
+        request_body = json.dumps({"model": request_model, "prompt": prompt.strip(),
+                                   "size": size, "quality": quality, "n": 1},
+                                  ensure_ascii=False).encode("utf-8")
+        content_type = "application/json"
+    else:
+        endpoint = base_url + "/images/edits"
+        fields = (("model", request_model), ("prompt", prompt.strip()), ("size", size),
+                  ("quality", quality), ("n", "1"))
+        boundary, request_body = _multipart_body(fields, images, checked_mask)
+        content_type = "multipart/form-data; boundary=" + boundary
+    request = urllib.request.Request(
+        endpoint, data=request_body,
+        headers={"Authorization": "Bearer " + profile["api_key"],
+                 "Content-Type": content_type, "Accept": "application/json"}, method="POST")
     current = manager.generation_profile()
-    if any(current[field] != profile[field] for field in ("id", "base_url", "api_key", "model", "output_dir")):
+    if any(current[field] != profile[field]
+           for field in ("id", "base_url", "api_key", "model", "output_dir", "model_settings")):
         raise RelayError("生图配置在提交前发生变化；本次请求未发送，请重新发起。")
     try:
         with _open(request, timeout=180) as response:
@@ -584,4 +786,4 @@ def generate_image(manager, prompt, size="1024x1024", quality="low"):
         raise RelayError("图片生成成功，但无法完整写入保存目录；请检查目录权限和磁盘空间。"
                          "本程序未自动重试。") from None
     return {"path": str(path.resolve()), "mime_type": mime_type, "width": width,
-            "height": height, "data": image, "model": profile["model"]}
+            "height": height, "data": image, "model": request_model}

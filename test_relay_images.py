@@ -1,9 +1,11 @@
 """Tests for the independent image relay and image response handling."""
 import base64
 from contextlib import contextmanager
+from email import policy
 import io
 import json
 import os
+from email.parser import BytesParser
 from email.message import Message
 from pathlib import Path
 import struct
@@ -27,9 +29,10 @@ def _chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
 
 
-def _png(width=1, height=1):
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    pixels = b"".join(b"\x00" + b"\x12\x34\x56" * width for _ in range(height))
+def _png(width=1, height=1, color_type=2):
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    pixel = b"\x12\x34\x56" if color_type == 2 else b"\x12\x34\x56\xff"
+    pixels = b"".join(b"\x00" + pixel * width for _ in range(height))
     return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", header)
             + _chunk(b"IDAT", zlib.compress(pixels)) + _chunk(b"IEND", b""))
 
@@ -57,6 +60,12 @@ class FakeResponse:
 
     def __exit__(self, *args):
         return False
+
+
+def _multipart_message(request):
+    content_type = request.get_header("Content-type")
+    raw = (b"Content-Type: " + content_type.encode("ascii") + b"\r\n\r\n" + request.data)
+    return BytesParser(policy=policy.default).parsebytes(raw)
 
 
 class _ImageTestBase:
@@ -163,6 +172,69 @@ class ImageRelayManagerTests(_ImageTestBase, unittest.TestCase):
         with self.assertRaises(RelayError):
             self.manager.save_profile("bad", "http://images.example/v1", "key", "model")
 
+    def test_model_specific_image_defaults_restore_and_legacy_defaults_survive(self):
+        profile_id = self._profile()
+        self.manager.apply(profile_id, "gpt-image-2", str(self.home / "out"),
+                           quality="high", size="2048x1024")
+        self.manager.set_enabled(True)
+        current = self.manager.generation_profile()
+        self.assertEqual(current["default_quality"], "high")
+        self.assertEqual(current["default_size"], "2048x1024")
+
+        self.manager.apply(profile_id, "another-image-model", str(self.home / "out"))
+        current = self.manager.generation_profile()
+        self.assertEqual(current["default_quality"], "low")
+        self.assertEqual(current["default_size"], "1024x1024")
+
+        self.manager.apply(profile_id, "gpt-image-2", str(self.home / "out"))
+        current = self.manager.generation_profile()
+        self.assertEqual(current["default_quality"], "high")
+        self.assertEqual(current["default_size"], "2048x1024")
+
+    def test_legacy_profile_without_model_settings_uses_default_image_options(self):
+        profile_id = self._profile()
+        self.manager.apply(profile_id, "gpt-image-2", str(self.home / "out"))
+        self.manager.set_enabled(True)
+        stored = json.loads(self.manager.profiles_file.read_text(encoding="utf-8"))
+        stored["profiles"][0].pop("model_settings", None)
+        self.manager.profiles_file.write_text(json.dumps(stored), encoding="utf-8")
+        current = self.manager.generation_profile()
+        self.assertEqual(current["default_quality"], "low")
+        self.assertEqual(current["default_size"], "1024x1024")
+
+    def test_invalid_image_defaults_do_not_disable_or_mutate_active_profile(self):
+        profile_id = self._profile()
+        self.manager.apply(profile_id, "gpt-image-2", str(self.home / "out"),
+                           quality="high", size="2048x1024")
+        self.manager.set_enabled(True)
+        with self.assertRaises(RelayError):
+            self.manager.apply(profile_id, "another-image-model", str(self.home / "out"),
+                               quality="max", size="4096x4112")
+        current = self.manager.generation_profile()
+        self.assertEqual(current["model"], "gpt-image-2")
+        self.assertEqual(current["default_quality"], "high")
+        self.assertEqual(current["default_size"], "2048x1024")
+
+    def test_apply_merges_per_model_settings_and_current_options_override(self):
+        profile_id = self._profile()
+        self.manager.apply(
+            profile_id, "gpt-image-2", str(self.home / "out"),
+            quality="high", size="2048x1024",
+            model_settings={
+                "gpt-image-2": {"quality": "medium", "size": "1536x1024"},
+                "cached-image-model": {"quality": "auto", "size": "1000x1024"},
+            })
+        self.manager.set_enabled(True)
+        profile = self.manager.get_profile(profile_id)
+        self.assertEqual(profile["model_settings"], {
+            "gpt-image-2": {"quality": "high", "size": "2048x1024"},
+            "cached-image-model": {"quality": "auto", "size": "1000x1024"},
+        })
+        self.manager.apply(profile_id, "cached-image-model", str(self.home / "out"))
+        current = self.manager.generation_profile()
+        self.assertEqual(current["default_quality"], "auto")
+        self.assertEqual(current["default_size"], "1000x1024")
+
 
 class ImageGenerationTests(_ImageTestBase, unittest.TestCase):
     def setUp(self):
@@ -198,6 +270,181 @@ class ImageGenerationTests(_ImageTestBase, unittest.TestCase):
         self.assertEqual(result["data"], png)
         self.assertTrue(Path(result["path"]).is_absolute())
         self.assertEqual(Path(result["path"]).read_bytes(), png)
+
+    def test_reference_edit_uses_multipart_and_preserves_single_result(self):
+        reference = self.home / "reference.png"
+        mask = self.home / "mask.png"
+        reference.write_bytes(_png(2, 3))
+        mask.write_bytes(_png(2, 3, color_type=6))
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png(4, 5)).decode("ascii")
+        }]}).encode()
+        seen = []
+
+        def open_request(request, timeout):
+            seen.append((request, timeout))
+            return FakeResponse(response_body)
+
+        with patch("relay_images._open", side_effect=open_request):
+            result = generate_image(self.manager, "Edit this image", size="2048x1024",
+                                    quality="auto", input_images=[str(reference)],
+                                    mask=str(mask))
+        self.assertEqual(len(seen), 1)
+        request = seen[0][0]
+        self.assertEqual(request.full_url, "https://images.example/v1/images/edits")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer image-secret")
+        self.assertTrue(request.get_header("Content-type").startswith("multipart/form-data; boundary="))
+        message = _multipart_message(request)
+        parts = {part.get_param("name", header="content-disposition"): part
+                 for part in message.iter_parts()}
+        self.assertEqual(parts["model"].get_content(), "gpt-image-2")
+        self.assertEqual(parts["prompt"].get_content(), "Edit this image")
+        self.assertEqual(parts["size"].get_content(), "2048x1024")
+        self.assertEqual(parts["quality"].get_content(), "auto")
+        self.assertEqual(parts["n"].get_content(), "1")
+        self.assertEqual(parts["image[]"].get_payload(decode=True), _png(2, 3))
+        self.assertEqual(parts["mask"].get_payload(decode=True), _png(2, 3, color_type=6))
+        self.assertEqual(result["model"], "gpt-image-2")
+        self.assertEqual(Path(result["path"]).read_bytes(), _png(4, 5))
+
+    def test_multiple_references_are_sent_as_repeated_image_parts(self):
+        first = self.home / "first.png"
+        second = self.home / "second.png"
+        first.write_bytes(_png(1, 1))
+        second.write_bytes(_png(2, 2))
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png()).decode("ascii")
+        }]}).encode()
+        with patch("relay_images._open", return_value=FakeResponse(response_body)) as open_request:
+            generate_image(self.manager, "Combine references",
+                           input_images=[str(first), str(second)])
+        message = _multipart_message(open_request.call_args.args[0])
+        image_parts = [part for part in message.iter_parts()
+                       if part.get_param("name", header="content-disposition") == "image[]"]
+        self.assertEqual([part.get_payload(decode=True) for part in image_parts],
+                         [_png(1, 1), _png(2, 2)])
+
+    def test_invalid_reference_path_is_rejected_before_network(self):
+        with patch("relay_images._open") as open_request:
+            with self.assertRaisesRegex(RelayError, "绝对本地路径|不存在"):
+                generate_image(self.manager, "Edit this", input_images=["relative.png"])
+        open_request.assert_not_called()
+
+    def test_invalid_reference_content_is_rejected_before_network(self):
+        reference = self.home / "reference.png"
+        reference.write_bytes(b"not an image")
+        with patch("relay_images._open") as open_request:
+            with self.assertRaisesRegex(RelayError, "不是受支持"):
+                generate_image(self.manager, "Edit this", input_images=[str(reference)])
+        open_request.assert_not_called()
+
+    def test_mask_requires_one_reference_and_png_content_before_network(self):
+        first = self.home / "first.png"
+        second = self.home / "second.png"
+        mask = self.home / "mask.jpg"
+        first.write_bytes(_png())
+        second.write_bytes(_png())
+        mask.write_bytes(_png(color_type=6))
+        with patch("relay_images._open") as open_request:
+            with self.assertRaisesRegex(RelayError, "遮罩|mask|一张"):
+                generate_image(self.manager, "Edit this", input_images=[str(first), str(second)],
+                               mask=str(mask))
+        open_request.assert_not_called()
+
+    def test_mask_requires_matching_png_alpha_before_network(self):
+        reference = self.home / "reference.png"
+        rgb_mask = self.home / "rgb-mask.png"
+        wrong_size_mask = self.home / "wrong-size-mask.png"
+        reference.write_bytes(_png(2, 3))
+        rgb_mask.write_bytes(_png(2, 3))
+        wrong_size_mask.write_bytes(_png(1, 1, color_type=6))
+        with patch("relay_images._open") as open_request:
+            for mask in (rgb_mask, wrong_size_mask):
+                with self.subTest(mask=mask.name), self.assertRaises(RelayError):
+                    generate_image(self.manager, "Edit this", input_images=[str(reference)],
+                                   mask=str(mask))
+        open_request.assert_not_called()
+
+    def test_explicit_dynamic_size_and_unverified_quality_are_sent(self):
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png()).decode("ascii")
+        }]}).encode()
+        with patch("relay_images._open", return_value=FakeResponse(response_body)) as open_request:
+            generate_image(self.manager, "A large image", size="4096x4096", quality="max")
+        request = open_request.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["size"], "4096x4096")
+        self.assertEqual(payload["quality"], "max")
+
+    def test_invalid_dynamic_size_is_rejected_before_network(self):
+        with patch("relay_images._open") as open_request:
+            for size in ("0x1024", "4096x4112", "4097x4096", "12x", "9" * 5000 + "x16"):
+                with self.subTest(size=size), self.assertRaises(RelayError):
+                    generate_image(self.manager, "Invalid dimensions", size=size)
+        open_request.assert_not_called()
+
+    def test_non_preset_positive_dimensions_are_passed_through(self):
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png()).decode("ascii")
+        }]}).encode()
+        with patch("relay_images._open", return_value=FakeResponse(response_body)) as open_request:
+            generate_image(self.manager, "Relay decides support", size="1000x1024")
+        self.assertEqual(json.loads(open_request.call_args.args[0].data)["size"], "1000x1024")
+
+    def test_saved_defaults_are_used_when_call_options_are_omitted(self):
+        self.manager.apply(self.profile_id, "gpt-image-2", str(self.output_dir),
+                           quality="high", size="2048x1024")
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png()).decode("ascii")
+        }]}).encode()
+        with patch("relay_images._open", return_value=FakeResponse(response_body)) as open_request:
+            generate_image(self.manager, "Use saved defaults")
+        payload = json.loads(open_request.call_args.args[0].data)
+        self.assertEqual(payload["quality"], "high")
+        self.assertEqual(payload["size"], "2048x1024")
+
+    def test_edit_timeout_is_not_retried(self):
+        reference = self.home / "reference.png"
+        reference.write_bytes(_png())
+        with patch("relay_images._open", side_effect=TimeoutError) as open_request:
+            with self.assertRaisesRegex(RelayError, "未自动重试"):
+                generate_image(self.manager, "Edit once", input_images=[str(reference)])
+        self.assertEqual(open_request.call_count, 1)
+
+    def test_model_settings_change_during_preflight_prevents_submission(self):
+        original = relay_images._check_output_dir
+
+        def change_after_check(value):
+            directory = original(value)
+            self.manager.apply(self.profile_id, "gpt-image-2", str(self.output_dir),
+                               quality="high", size="1536x1024")
+            return directory
+
+        with (patch("relay_images._check_output_dir", side_effect=change_after_check),
+              patch("relay_images._open") as open_request):
+            with self.assertRaisesRegex(RelayError, "提交前发生变化"):
+                generate_image(self.manager, "Do not submit")
+        open_request.assert_not_called()
+
+    def test_model_override_uses_cached_model_without_persisting_it(self):
+        self.manager.save_models(self.profile_id, ["gpt-image-2", "cached-image-model"])
+        response_body = json.dumps({"data": [{
+            "b64_json": base64.b64encode(_png()).decode("ascii")
+        }]}).encode()
+        with patch("relay_images._open", return_value=FakeResponse(response_body)) as open_request:
+            result = generate_image(self.manager, "Use cached model", model="cached-image-model")
+        payload = json.loads(open_request.call_args.args[0].data)
+        self.assertEqual(payload["model"], "cached-image-model")
+        self.assertEqual(result["model"], "cached-image-model")
+        self.assertEqual(self.manager.generation_profile()["model"], "gpt-image-2")
+
+    def test_model_override_outside_cached_models_is_rejected_before_network(self):
+        self.manager.save_models(self.profile_id, ["gpt-image-2", "cached-image-model"])
+        with patch("relay_images._open") as open_request:
+            with self.assertRaisesRegex(RelayError, "模型"):
+                generate_image(self.manager, "Do not send", model="unlisted-image-model")
+        open_request.assert_not_called()
 
     def test_disabled_request_is_rejected_before_network(self):
         self.manager.set_enabled(False)

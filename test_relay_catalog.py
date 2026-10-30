@@ -5,11 +5,120 @@ import unittest
 from pathlib import Path
 
 from relay_core import RelayError, _catalog_auto_review_model
+import relay_catalog
 from relay_catalog import refresh_official_model_catalog, write_model_catalog
 from unittest.mock import patch
 
 
 class RelayCatalogAutoReviewTests(unittest.TestCase):
+    def test_reasoning_choices_follow_the_same_catalog_as_written_models(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            entry = relay_catalog._fallback('limited-model')
+            entry.update(supported_reasoning_levels=[
+                {'effort': 'low', 'description': 'light'},
+                {'effort': 'medium', 'description': 'medium'}],
+                default_reasoning_level='medium')
+            directory = home / 'relay-switcher'
+            directory.mkdir()
+            (directory / 'official_model_catalog.json').write_text(
+                json.dumps({'models': [entry]}), encoding='utf-8')
+            options = relay_catalog.reasoning_options(home, {}, 'limited-model')
+            self.assertTrue(options['known'])
+            self.assertEqual(options['values'], ('light', 'medium'))
+            self.assertEqual(options['default'], 'medium')
+            unknown = relay_catalog.reasoning_options(home, {}, 'unknown-model')
+            self.assertFalse(unknown['known'])
+
+    def test_known_empty_levels_are_distinct_from_unknown_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            source = home / 'custom.json'
+            entry = relay_catalog._fallback('no-reasoning')
+            source.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(source)}, 'no-reasoning')
+            self.assertTrue(options['known'])
+            self.assertEqual(options['values'], ('auto',))
+            self.assertEqual(options['default'], 'auto')
+
+    def test_explicit_none_and_minimal_levels_are_not_lost(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            source = home / 'custom.json'
+            entry = relay_catalog._fallback('special-levels')
+            entry.update(supported_reasoning_levels=[
+                {'effort': 'none', 'description': 'none'},
+                {'effort': 'minimal', 'description': 'minimal'}],
+                default_reasoning_level='minimal')
+            source.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(source)}, 'special-levels')
+            self.assertEqual(options['values'], ('none', 'minimal'))
+            self.assertEqual(options['default'], 'minimal')
+
+    def test_generated_unknown_fallback_does_not_become_known_empty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            generated = write_model_catalog(home, {}, ['unlisted-model'], 'unlisted-model')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(generated)}, 'unlisted-model')
+            self.assertFalse(options['known'])
+
+    def test_explicit_catalog_remains_a_source_after_switching(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            source = home / 'custom.json'
+            entry = relay_catalog._fallback('external-only-model')
+            entry.update(supported_reasoning_levels=[{'effort': 'high', 'description': 'high'}],
+                         default_reasoning_level='high')
+            source.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+            generated = write_model_catalog(home, {'model_catalog_json': str(source)},
+                                            ['external-only-model'], 'external-only-model')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(generated)}, 'external-only-model')
+            self.assertTrue(options['known'])
+            self.assertEqual(options['values'], ('high',))
+            entry['supported_reasoning_levels'] = []
+            source.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(generated)}, 'external-only-model')
+            self.assertEqual(options['values'], ('auto',))
+
+    def test_explicit_catalog_precedence_and_malformed_reasoning_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            explicit = home / 'custom.json'
+            entry = relay_catalog._fallback('custom-model')
+            entry.update(supported_reasoning_levels=[{'effort': 'high', 'description': 'high'}],
+                         default_reasoning_level='high')
+            explicit.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+            directory = home / 'relay-switcher'
+            directory.mkdir()
+            invalid = dict(entry, supported_reasoning_levels=[{'effort': {}}])
+            (directory / 'official_model_catalog.json').write_text(
+                json.dumps({'models': [invalid]}), encoding='utf-8')
+            options = relay_catalog.reasoning_options(
+                home, {'model_catalog_json': str(explicit)}, 'custom-model')
+            self.assertEqual(options['values'], ('high',))
+            self.assertFalse(relay_catalog.reasoning_options(home, {}, 'custom-model')['known'])
+
+    def test_identical_external_catalogs_keep_distinct_source_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            paths = []
+            for filename in ('first.json', 'second.json'):
+                source = home / filename
+                source.write_text(json.dumps({'models': [relay_catalog._fallback('custom-model')]}),
+                                  encoding='utf-8')
+                paths.append(write_model_catalog(home, {'model_catalog_json': str(source)},
+                                                  [], 'custom-model'))
+            self.assertNotEqual(paths[0], paths[1])
+            paths[0].with_suffix('.source.json').write_text('{}', encoding='utf-8')
+            with self.assertRaises(RelayError):
+                relay_catalog.reasoning_options(home, {'model_catalog_json': str(paths[0])},
+                                                'custom-model')
+
     def test_override_applies_to_every_relay_model(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

@@ -275,8 +275,6 @@ class ProfileDialog(tk.Toplevel):
             )
             if not self.image:
                 values.update(
-                    reasoning_effort=self.profile.get("reasoning_effort", "high"),
-                    subagent_reasoning_effort=self.profile.get("subagent_reasoning_effort", "max"),
                     subagent_model=self.profile.get("subagent_model", ""),
                 )
             self.saved_id = self.manager.save_profile(**values)
@@ -304,6 +302,13 @@ class Switcher(tk.Tk):
         self.model_profile_id = None
         self.current_profile_id = None
         self.current_auto_review_model = ""
+        self.current_model = ""
+        self._loading_model_choices = False
+        self._effort_models = {"main": None, "child": None}
+        self._effort_memory = {"main": {}, "child": {}}
+        self._image_options_loading = False
+        self._image_option_model = None
+        self._image_option_memory = {}
         self.configure_styles()
         self.build_window()
         try:
@@ -472,8 +477,10 @@ class Switcher(tk.Tk):
         ttk.Label(reasoning_controls, text="推理强度来源", style="SurfaceField.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 10))
         self.official_reasoning_status = tk.StringVar(value="获取模型时同步 OpenAI 官方模型能力目录")
-        ttk.Label(reasoning_controls, textvariable=self.official_reasoning_status,
-                  style="SurfaceMuted.TLabel").grid(row=0, column=1, columnspan=2, sticky="w")
+        reasoning_note = ttk.Label(reasoning_controls, textvariable=self.official_reasoning_status,
+                                   style="SurfaceMuted.TLabel")
+        reasoning_note.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self.wrap_label(reasoning_note, reasoning_controls, 100)
 
         subagent_controls = ttk.Frame(model_controls, style="Surface.TFrame")
         subagent_controls.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
@@ -503,6 +510,8 @@ class Switcher(tk.Tk):
         self.review_model_combo = ttk.Combobox(
             review_controls, textvariable=self.selected_review_model, width=14)
         self.review_model_combo.grid(row=0, column=1, sticky="ew")
+        self.selected_model.trace_add("write", self.refresh_reasoning_choices)
+        self.selected_subagent_model.trace_add("write", self.refresh_reasoning_choices)
         ttk.Label(review_controls, text="留空使用默认 reviewer", style="SurfaceMuted.TLabel").grid(
             row=0, column=2, padx=(12, 0))
         controls = ttk.Frame(main)
@@ -574,6 +583,24 @@ class Switcher(tk.Tk):
         self.image_model_combo.grid(row=1, column=0, sticky="ew")
         self.image_fetch_button = ttk.Button(image_controls, text="获取模型", command=self.fetch_images)
         self.image_fetch_button.grid(row=1, column=1, padx=(12, 0))
+        image_parameters = ttk.Frame(image_controls, style="Surface.TFrame")
+        image_parameters.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        image_parameters.columnconfigure(1, weight=1)
+        ttk.Label(image_parameters, text="默认画质", style="SurfaceField.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8))
+        self.selected_image_quality = tk.StringVar(value="low")
+        self.image_quality_combo = ttk.Combobox(
+            image_parameters, textvariable=self.selected_image_quality, width=8, state="readonly",
+            values=("auto", "low", "medium", "high", "xhigh", "max"))
+        self.image_quality_combo.grid(row=0, column=1, sticky="ew")
+        ttk.Label(image_parameters, text="默认尺寸", style="SurfaceField.TLabel").grid(
+            row=0, column=2, sticky="w", padx=(16, 8))
+        self.selected_image_size = tk.StringVar(value="1024x1024")
+        self.image_size_combo = ttk.Combobox(
+            image_parameters, textvariable=self.selected_image_size, width=16,
+            values=("auto", "1024x1024", "1024x1536", "1536x1024"))
+        self.image_size_combo.grid(row=0, column=3, sticky="ew")
+        self.selected_image_model.trace_add("write", self.refresh_image_parameters)
         image_actions = ttk.Frame(page)
         image_actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         self.image_edit_button = ttk.Button(image_actions, text="编辑", command=self.edit_image)
@@ -598,7 +625,7 @@ class Switcher(tk.Tk):
         self.wrap_label(output, image_settings, 200)
         self.image_status = tk.StringVar(value="选择或添加一个图片 API 站点。")
         note = ttk.Label(page, text="首次应用会注册 MCP 工具，需重启 Codex；之后切换当前生图模型并点击“应用”，下次生图即可使用，无需重启。\n"
-                         "启用开关即时影响新请求。仅支持文字生图，每次一张；已提交的请求无法通过开关撤销。",
+                          "支持文字生图与参考图编辑，每次一张；xhigh/max 画质与自定义尺寸需接口支持，已提交请求无法通过开关撤销。",
                          style="Muted.TLabel")
         note.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.wrap_label(note, page)
@@ -616,11 +643,31 @@ class Switcher(tk.Tk):
                        self.image_apply_button, self.image_fetch_button):
             button.configure(state=state)
         self.image_model_combo.configure(state=state)
+        self.image_quality_combo.configure(state="readonly" if state == "normal" else state)
+        self.image_size_combo.configure(state=state)
         if selected != getattr(self, "image_model_profile_id", None):
             self.image_model_profile_id = selected
             profile = self.image_profiles.get(selected, {})
+            self._image_option_memory = {
+                model: dict(options) for model, options in profile.get("model_settings", {}).items()}
+            self._image_option_model = None
+            self._image_options_loading = True
             self.selected_image_model.set(profile.get("model", ""))
+            self._image_options_loading = False
+            self.refresh_image_parameters()
             self.image_model_combo.configure(values=profile.get("models", []))
+
+    def refresh_image_parameters(self, *args):
+        if self._image_options_loading:
+            return
+        if self._image_option_model is not None:
+            self._image_option_memory[self._image_option_model] = {
+                "quality": self.selected_image_quality.get(), "size": self.selected_image_size.get()}
+        model = self.selected_image_model.get().strip()
+        options = self._image_option_memory.get(model, {})
+        self.selected_image_quality.set(options.get("quality", "low"))
+        self.selected_image_size.set(options.get("size", "1024x1024"))
+        self._image_option_model = model
 
     def refresh_images(self, select=None):
         settings = self.image_manager.settings()
@@ -761,8 +808,17 @@ class Switcher(tk.Tk):
         if not profile_id or getattr(self, "image_fetching", False):
             return
         try:
+            from relay_images import validate_image_options
+            validate_image_options(self.selected_image_size.get(), self.selected_image_quality.get())
+        except Exception as exc:
+            show_error(self, exc)
+            return
+        try:
+            self.image_manager.apply(profile_id, self.selected_image_model.get(), DEFAULT_OUTPUT_DIR,
+                                     quality=self.selected_image_quality.get(), size=self.selected_image_size.get(),
+                                     model_settings={model: options for model, options in self._image_option_memory.items()
+                                                     if model in self.image_profiles[profile_id].get('models', [])})
             self.image_manager.set_enabled(False)
-            self.image_manager.apply(profile_id, self.selected_image_model.get(), DEFAULT_OUTPUT_DIR)
             registration = register_mcp(
                 self.image_manager.home,
                 script_path=Path(__file__).with_name("relay_image_mcp.py"),
@@ -809,10 +865,19 @@ class Switcher(tk.Tk):
         if selected != self.model_profile_id:
             self.model_profile_id = selected
             profile = self.profiles.get(selected, {})
+            self._effort_models = {"main": None, "child": None}
+            self._effort_memory = {
+                "main": dict(profile.get("model_reasoning_efforts", {})),
+                "child": dict(profile.get("subagent_model_reasoning_efforts", {})),
+            }
+            self._loading_model_choices = True
             self.selected_model.set(profile.get("model", ""))
             self.selected_effort.set(profile.get("reasoning_effort", "high"))
             self.selected_subagent_model.set(profile.get("subagent_model", ""))
             self.selected_subagent_effort.set(profile.get("subagent_reasoning_effort", "max"))
+            self._effort_memory["main"][self.selected_model.get().strip()] = self.selected_effort.get()
+            self._effort_memory["child"][self.selected_subagent_model.get().strip()] = self.selected_subagent_effort.get()
+            self._loading_model_choices = False
             self.selected_review_model.set(profile.get(
                 "auto_review_model",
                 self.current_auto_review_model if selected == self.current_profile_id else ""
@@ -820,11 +885,53 @@ class Switcher(tk.Tk):
             self.model_combo.configure(values=profile.get("models", []))
             self.subagent_model_combo.configure(values=profile.get("models", []))
             self.review_model_combo.configure(values=profile.get("models", []))
+        self.refresh_reasoning_choices()
+
+    def refresh_reasoning_choices(self, *args):
+        if self._loading_model_choices or not self.manager or not self.selected_id():
+            return
+        descriptions = []
+        for kind, model_variable, effort_variable, combo, preferred, label in (
+                ("main", self.selected_model, self.selected_effort, self.effort_combo, "high", "主模型"),
+                ("child", self.selected_subagent_model, self.selected_subagent_effort,
+                 self.subagent_effort_combo, "max", "子代理")):
+            model = model_variable.get().strip()
+            previous = self._effort_models[kind]
+            memory = self._effort_memory[kind]
+            if previous is not None:
+                memory[previous] = effort_variable.get()
+            candidate = memory.get(model, preferred) if previous != model else effort_variable.get()
+            target = model or (self.current_model if kind == "main" else "")
+            try:
+                options = self.manager.reasoning_options(target)
+            except RelayError:
+                combo.configure(values=(), state="disabled")
+                descriptions.append(label + "：目录无法读取，应用前需修复")
+                continue
+            values = options["values"]
+            if not options["known"] and candidate not in values:
+                values = (candidate,) + values
+            if candidate not in values and options["known"]:
+                candidate = preferred if previous != model and preferred in values else options["default"]
+            combo.configure(values=values, state="readonly")
+            effort_variable.set(candidate)
+            memory[model] = candidate
+            self._effort_models[kind] = model
+            if kind == "child" and not model:
+                descriptions.append("子代理：Codex 自动选择模型，强度未校验")
+            elif not options["known"]:
+                descriptions.append(label + "：能力未知，保留原选择")
+            elif values == ("auto",):
+                descriptions.append(label + "：不覆盖推理强度（auto）")
+            else:
+                descriptions.append(label + "：按本地目录限制档位")
+        self.official_reasoning_status.set("OpenAI 官方模型能力目录 / 本地目录；" + "；".join(descriptions))
 
     def refresh(self, select=None):
         current = self.manager.current()
         self.current_profile_id = current.get("id")
         self.current_auto_review_model = current.get("auto_review_model", "")
+        self.current_model = current.get("model", "")
         profiles = self.manager.list_profiles()
         self.profiles = {profile["id"]: profile for profile in profiles}
         self.tree.delete(*self.tree.get_children())
@@ -886,7 +993,9 @@ class Switcher(tk.Tk):
                                                   updated.get("model") or "沿用当前默认模型"))
                 if self.selected_id() == profile_id:
                     self.model_combo.configure(values=catalog.models)
+                    self.subagent_model_combo.configure(values=catalog.models)
                     self.review_model_combo.configure(values=catalog.models)
+                    self.refresh_reasoning_choices()
                 self.status.set(f"“{station_name}”已缓存 {len(catalog.models)} 个模型，请选择默认模型后点击切换。" +
                                 ("已更新 API 地址。" if catalog.base_url != base_url else ""))
             except Exception as exc:
@@ -951,7 +1060,9 @@ class Switcher(tk.Tk):
                                       reasoning_effort=self.selected_effort.get(),
                                       auto_review_model=self.selected_review_model.get(),
                                       subagent_reasoning_effort=self.selected_subagent_effort.get(),
-                                      subagent_model=self.selected_subagent_model.get())
+                                      subagent_model=self.selected_subagent_model.get(),
+                                      model_reasoning_efforts=self._effort_memory['main'],
+                                      subagent_model_reasoning_efforts=self._effort_memory['child'])
             profile.clear()
             provider_ids = self.manager.switch(profile_id)
             name = self.profiles[profile_id]["name"]

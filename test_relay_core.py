@@ -161,6 +161,103 @@ class SubagentReasoningTests(unittest.TestCase):
         locking.start()
         self.addCleanup(locking.stop)
 
+    def install_limited_catalog(self):
+        from relay_catalog import _fallback
+        entries = []
+        for model, efforts in [('limited-main', ['low', 'medium']),
+                               ('limited-child', ['medium', 'high']),
+                               ('no-reasoning', [])]:
+            entry = _fallback(model)
+            entry.update(supported_reasoning_levels=[
+                {'effort': effort, 'description': effort} for effort in efforts],
+                default_reasoning_level='medium' if efforts else 'none')
+            entries.append(entry)
+        (self.home / 'relay-switcher').mkdir(exist_ok=True)
+        (self.home / 'relay-switcher' / 'official_model_catalog.json').write_text(
+            json.dumps({'models': entries}), encoding='utf-8')
+
+    def test_invalid_known_main_effort_is_rejected_before_save(self):
+        manager = RelayManager(self.home)
+        self.install_limited_catalog()
+        original = manager.profiles_file.read_bytes()
+        with self.assertRaisesRegex(RelayError, '推理|强度'):
+            manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                 model='limited-main', reasoning_effort='max')
+        self.assertEqual(manager.profiles_file.read_bytes(), original)
+        self.assertFalse(manager.config.exists())
+
+    def test_efforts_remembered_per_model_and_per_station(self):
+        manager = RelayManager(self.home)
+        self.install_limited_catalog()
+        station = manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                       model='limited-main', reasoning_effort='light')
+        manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                             model='limited-child', profile_id=station,
+                             reasoning_effort='high')
+        manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                             model='limited-main', profile_id=station)
+        self.assertEqual(manager.get_profile(station)['reasoning_effort'], 'light')
+        other = manager.save_profile('other', 'https://other.example/v1', 'synthetic-key',
+                                     model='limited-main')
+        self.assertEqual(manager.get_profile(other)['reasoning_effort'], 'medium')
+        manager.save_profile('new connection', 'https://new.example/v1', 'synthetic-key',
+                             model='limited-main', profile_id=station)
+        self.assertEqual(manager.get_profile(station)['reasoning_effort'], 'medium')
+
+    def test_explicit_child_model_uses_its_own_valid_default(self):
+        manager = RelayManager(self.home)
+        self.install_limited_catalog()
+        station = manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                       model='limited-main', subagent_model='limited-child')
+        profile = manager.get_profile(station)
+        self.assertEqual(profile['reasoning_effort'], 'medium')
+        self.assertEqual(profile['subagent_reasoning_effort'], 'medium')
+        with self.assertRaisesRegex(RelayError, '推理|强度'):
+            manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                 model='limited-main', profile_id=station,
+                                 subagent_model='limited-child', subagent_reasoning_effort='max')
+
+    def test_known_non_reasoning_model_removes_stale_overrides(self):
+        manager = RelayManager(self.home)
+        self.install_limited_catalog()
+        manager.config.write_bytes(b'model_reasoning_effort = "max"\n[agents]\nmax_threads = 3\ndefault_subagent_reasoning_effort = "max"\n')
+        station = manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                       model='no-reasoning', subagent_model='no-reasoning')
+        manager.switch(station)
+        parsed = _parse(manager.config.read_bytes())
+        self.assertNotIn('model_reasoning_effort', parsed)
+        self.assertNotIn('default_subagent_reasoning_effort', parsed['agents'])
+        self.assertEqual(parsed['agents']['max_threads'], 3)
+
+    def test_switch_rechecks_catalog_changes_without_rewriting_config(self):
+        manager = RelayManager(self.home)
+        station = manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                       model='limited-main', reasoning_effort='max')
+        self.install_limited_catalog()
+        with self.assertRaisesRegex(RelayError, '推理|强度'):
+            manager.switch(station)
+        self.assertFalse(manager.config.exists())
+        self.assertFalse(manager.backup_file.exists())
+
+    def test_switch_uses_one_capability_snapshot_for_validation_and_catalog(self):
+        from relay_catalog import _fallback
+        manager = RelayManager(self.home)
+        station = manager.save_profile('station', 'https://relay.example/v1', 'synthetic-key',
+                                       model='changing-model', reasoning_effort='max')
+        before = _fallback('changing-model')
+        before.update(supported_reasoning_levels=[{'effort': 'max', 'description': 'max'}],
+                      default_reasoning_level='max')
+        after = dict(before, supported_reasoning_levels=[{'effort': 'medium', 'description': 'medium'}],
+                     default_reasoning_level='medium')
+        snapshots = iter(({'changing-model': before}, {'changing-model': after}))
+        with patch('relay_catalog._resolve_models', side_effect=lambda *args: next(snapshots)):
+            manager.switch(station)
+        config = _parse(manager.config.read_bytes())
+        catalog = json.loads(Path(config['model_catalog_json']).read_text(encoding='utf-8'))
+        self.assertIn(config['model_reasoning_effort'],
+                      [item['effort'] for item in catalog['models'][0]['supported_reasoning_levels']])
+
+
     def test_all_subagent_choices_are_independent_and_preserve_other_agent_settings(self):
         originals = (b'', chr(10).join([
             '# retained comment', '[agents]', 'max_threads = 4',

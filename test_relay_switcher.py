@@ -1,6 +1,7 @@
 """GUI checks with synthetic credentials, isolated homes, and no network."""
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -50,6 +51,131 @@ class ImagePageTests(unittest.TestCase):
 
     def tearDown(self):
         self.assertEqual(self.callback_errors, [])
+
+    def install_reasoning_catalog(self):
+        from relay_catalog import _fallback
+        entries = []
+        for model, efforts in [('limited-main', ['low', 'medium']),
+                               ('limited-child', ['medium', 'high']),
+                               ('no-reasoning', [])]:
+            entry = _fallback(model)
+            entry.update(supported_reasoning_levels=[
+                {'effort': effort, 'description': effort} for effort in efforts],
+                default_reasoning_level='medium' if efforts else 'none')
+            entries.append(entry)
+        (self.home / 'relay-switcher' / 'official_model_catalog.json').write_text(
+            json.dumps({'models': entries}), encoding='utf-8')
+
+    def test_model_changes_filter_and_remember_independent_reasoning_choices(self):
+        self.install_reasoning_catalog()
+        station = self.app.manager.save_profile(
+            'station', 'https://relay.example/v1', 'synthetic-key',
+            model='limited-main', subagent_model='limited-child')
+        self.app.refresh(station)
+        self.assertEqual(tuple(self.app.effort_combo['values']), ('light', 'medium'))
+        self.assertEqual(tuple(self.app.subagent_effort_combo['values']), ('medium', 'high'))
+        self.assertEqual(self.app.selected_effort.get(), 'medium')
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'medium')
+        self.app.selected_effort.set('light')
+        self.app.selected_model.set('limited-child')
+        self.assertEqual(tuple(self.app.effort_combo['values']), ('medium', 'high'))
+        self.assertEqual(self.app.selected_effort.get(), 'high')
+        self.app.selected_model.set('limited-main')
+        self.assertEqual(self.app.selected_effort.get(), 'light')
+        self.assertEqual(self.app.selected_subagent_model.get(), 'limited-child')
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_non_reasoning_model_clears_overrides_but_auto_child_remains_independent(self):
+        self.install_reasoning_catalog()
+        station = self.app.manager.save_profile(
+            'station', 'https://relay.example/v1', 'synthetic-key', model='no-reasoning')
+        self.app.refresh(station)
+        self.assertEqual(tuple(self.app.effort_combo['values']), ('auto',))
+        self.assertEqual(self.app.selected_effort.get(), 'auto')
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'max')
+        self.app.switch()
+        self.errors.assert_not_called()
+        parsed = _parse(self.config.read_bytes())
+        self.assertNotIn('model_reasoning_effort', parsed)
+        self.assertEqual(parsed['agents']['default_subagent_reasoning_effort'], 'max')
+
+    def test_apply_preserves_other_models_edited_in_same_window(self):
+        self.install_reasoning_catalog()
+        station = self.app.manager.save_profile(
+            'station', 'https://relay.example/v1', 'synthetic-key', model='limited-main')
+        self.app.refresh(station)
+        self.app.selected_effort.set('light')
+        self.app.selected_model.set('limited-child')
+        self.app.selected_effort.set('high')
+        self.app.selected_subagent_model.set('limited-main')
+        self.app.selected_subagent_effort.set('light')
+        self.app.selected_subagent_model.set('limited-child')
+        self.app.switch()
+        self.errors.assert_not_called()
+        self.app.refresh(station)
+        self.app.selected_model.set('limited-main')
+        self.app.selected_subagent_model.set('limited-main')
+        self.assertEqual(self.app.selected_effort.get(), 'light')
+        self.assertEqual(self.app.selected_subagent_effort.get(), 'light')
+
+    def test_known_choices_refresh_after_cache_changes_for_same_model(self):
+        station = self.app.manager.save_profile(
+            'station', 'https://relay.example/v1', 'synthetic-key', model='limited-main',
+            reasoning_effort='max')
+        self.app.refresh(station)
+        self.assertEqual(self.app.selected_effort.get(), 'max')
+        self.install_reasoning_catalog()
+        self.app.update_selection()
+        self.assertEqual(tuple(self.app.effort_combo['values']), ('light', 'medium'))
+        self.assertEqual(self.app.selected_effort.get(), 'medium')
+
+    def test_image_defaults_apply_and_restore_when_current_model_changes(self):
+        self.app.selected_image_quality.set('high')
+        self.app.selected_image_size.set('1536x1024')
+        self.app.apply_image()
+        self.errors.assert_not_called()
+        profile = self.app.image_manager.generation_profile()
+        self.assertEqual(profile['default_quality'], 'high')
+        self.assertEqual(profile['default_size'], '1536x1024')
+        self.app.selected_image_model.set('alternate-image-model')
+        self.assertEqual(self.app.selected_image_quality.get(), 'low')
+        self.app.selected_image_quality.set('auto')
+        self.app.apply_image()
+        self.app.selected_image_model.set('image-model')
+        self.assertEqual(self.app.selected_image_quality.get(), 'high')
+        self.assertEqual(self.app.selected_image_size.get(), '1536x1024')
+        self.errors.assert_not_called()
+
+    def test_invalid_image_size_does_not_disable_already_enabled_tool(self):
+        self.app.apply_image()
+        before = self.app.image_manager.generation_profile()
+        self.app.selected_image_size.set('invalid-size')
+        self.app.apply_image()
+        self.errors.assert_called_once()
+        after = self.app.image_manager.generation_profile()
+        self.assertEqual(after['model'], before['model'])
+        self.assertEqual(after['default_size'], before['default_size'])
+
+    def test_apply_preserves_image_options_edited_for_another_model(self):
+        self.app.selected_image_quality.set('high')
+        self.app.selected_image_size.set('1536x1024')
+        self.app.selected_image_model.set('alternate-image-model')
+        self.app.apply_image()
+        self.errors.assert_not_called()
+        self.app.refresh_images(self.profile_id)
+        self.app.selected_image_model.set('image-model')
+        self.assertEqual(self.app.selected_image_quality.get(), 'high')
+        self.assertEqual(self.app.selected_image_size.get(), '1536x1024')
+
+    def test_invalid_image_model_does_not_disable_already_enabled_tool(self):
+        self.app.apply_image()
+        self.errors.assert_not_called()
+        before = self.app.image_manager.generation_profile()
+        self.app.selected_image_model.set('')
+        self.app.apply_image()
+        self.errors.assert_called_once()
+        after = self.app.image_manager.generation_profile()
+        self.assertEqual(after['model'], before['model'])
 
     def test_tabs_defaults_and_model_selection_are_independent(self):
         self.assertEqual([self.app.tabs.tab(item, 'text') for item in self.app.tabs.tabs()], ['语言模型中转', '生图中转'])
