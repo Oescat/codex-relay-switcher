@@ -82,7 +82,19 @@ python relay_switcher.pyw
 
 **语言模型配置切换或恢复后，需要重开 Codex。** 已经运行的对话可能仍保留旧配置或连接。
 
-Auto Review 模型留空时由 Codex 默认选择；填写时，模型 ID 必须受所选站点支持。此设置通过站点模型目录应用到该站点的各个主模型，**不会启用 Auto Review，也不修改独立的 `/review` 模型设置**。
+点击 **应用为全局中转站** 时，同时写入以下全局默认设置，并替换配置文件中原来的 `sandbox_mode`、`approval_policy` 和 `approvals_reviewer`：
+
+```toml
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+```
+
+这组设置保留全盘文件访问，并为需要审批的操作启用 Auto Review。`danger-full-access` 不要求审批策略只能是 `never`；桌面端名称为 **Full Access** 的固定预设才使用 `never`。
+
+**Codex 桌面端还需选择实际权限模式。** 应用后完全退出并重开 Codex，在对话权限菜单选择 **自定义（config.toml）**，以读取上述组合。它仍提供全盘访问；**替我审批（Approve for me）** 使用工作区沙箱，不符合这里保留全盘访问的目标。本程序更新配置文件，不操作桌面端权限菜单；继续选择 Full Access 预设会选回 `never`。请检查新对话实际是否为 `danger-full-access`、`on-request`、`auto_review`。自定义模式的可用性取决于客户端版本和环境，未在用户客户端实际验证。
+
+自动审批生效后，已经允许的操作直接执行，需要审批的合适请求由 Auto Review 判断。Auto Review 模型留空时由 Codex 默认选择；填写时，模型 ID 必须受所选站点支持。此模型设置通过站点模型目录应用到该站点的各个主模型，不修改独立的 `/review` 模型设置。恢复上次配置时，配置文件中的审批设置一并恢复。客户端权限选择或启动参数仍可能覆盖全局默认值。
 
 ### 配置生图与参考图编辑
 
@@ -142,8 +154,8 @@ MCP 注册使用程序与 Python 的绝对路径。移动目录或更换 Python 
 - **语言模型：** 写入供 Codex 使用的 OpenAI Responses 兼容中转配置。模型目录可读取不等于所有模型都能稳定对话、调用工具或处理长上下文，需按所用站点实际验证。
 - **思考强度：** 已知模型按本地目录限制档位；未知模型保留选择并显示未知。界面中的 `light` 写入为 Codex 的 `low`；中转站是否真正执行所选强度仍需实际验证。
 - **生图与编辑：** 使用 OpenAI 兼容的 `/v1/images/generations` 和 multipart `/v1/images/edits`。已离线验证请求构造及保存流程，未证明特定中转站或图片模型支持所有参数。不包含视频或原生 Anthropic Messages 协议适配。
-- **桌面配置：** 语言模型应用时还会写入 `conversationDetailMode = "STEPS_COMMANDS"`。Codex 更新可能改变配置或模型目录的解释方式，请以所用客户端实际表现为准。
-- **审批：** 本项目不会修改 Codex 的全局审批策略。启用生图工具后，客户端仍可能要求审批。
+- **桌面配置：** 当前 Codex 报告旧版兼容项 `conversationDetailMode` 为无法识别的配置。语言模型应用时会移除原有的顶层字段，并停止写入；不自动猜测替代字段。Codex 更新可能改变配置或模型目录的解释方式，请以所用客户端实际表现为准。
+- **审批：** 应用语言模型全局配置时，写入 `danger-full-access`、`on-request` 和 `auto_review`；仅应用生图配置不会修改全局审批策略。仅需要审批的请求进入审核，不保证所有操作都会被审核或批准；明确的禁止规则仍可能拒绝执行。实际行为取决于 Codex 客户端、当前权限模式和审核模型是否可用。
 
 ## 测试与反馈
 

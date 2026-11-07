@@ -248,6 +248,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
     provider_ids = _global_provider_ids(before) if provider_ids is None else provider_ids
     text = original.decode('utf-8')
     newline = '\r\n' if '\r\n' in text else '\n'
+    approval_settings = dict(sandbox_mode='danger-full-access', approval_policy='on-request',
+                             approvals_reviewer='auto_review')
     reasoning_effort = _reasoning_effort(profile.get('reasoning_effort', 'high'))
     subagent_effort = _reasoning_effort(profile.get('subagent_reasoning_effort', 'max'))
     subagent_model = _optional_subagent_model(profile.get('subagent_model', ''))
@@ -272,6 +274,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
                 if subagent_model_setting:
                     retained.append(subagent_model_setting)
                 continue
+        if table and table[0] in approval_settings:
+            continue
         if len(table) >= 2 and table[0] == 'model_providers' and table[1] in provider_ids:
             continue
         if table == ('agents',) and stripped and not stripped.startswith('#'):
@@ -288,6 +292,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             if ('model_provider' in entry or (profile['model'] and 'model' in entry)
                     or 'model_reasoning_effort' in entry
                     or 'conversationDetailMode' in entry
+                    or any(key in entry for key in approval_settings)
                     or (catalog_path is not None and 'model_catalog_json' in entry)):
                 continue
         retained.append(statement)
@@ -298,7 +303,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
         prefix += 'model = ' + _quote(profile['model']) + newline
     if reasoning_effort != 'auto':
         prefix += 'model_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[reasoning_effort]) + newline
-    prefix += 'conversationDetailMode = "STEPS_COMMANDS"' + newline
+    for key, value in approval_settings.items():
+        prefix += key + ' = ' + _quote(value) + newline
     if catalog_path is not None:
         prefix += 'model_catalog_json = ' + _quote(str(catalog_path)) + newline
     provider = ''.join(newline.join(('[model_providers.' + _quote(provider_id) + ']',
@@ -321,6 +327,8 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             value.pop('model', None)
         value.pop('model_reasoning_effort', None)
         value.pop('conversationDetailMode', None)
+        for key in approval_settings:
+            value.pop(key, None)
         if catalog_path is not None:
             value.pop('model_catalog_json', None)
         agents = dict(value.get('agents', {}))

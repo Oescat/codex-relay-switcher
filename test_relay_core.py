@@ -49,7 +49,7 @@ command = "example-tool"
         self.assertEqual(after['model_provider'], 'relay_switcher')
         self.assertEqual(after['model'], 'test-model')
         self.assertEqual(after['model_reasoning_effort'], 'high')
-        self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
+        self.assertNotIn('conversationDetailMode', after)
         self.assertEqual(after['agents'], dict(max_threads=4, default_subagent_reasoning_effort='max'))
         for provider_id in ('custom', 'relay_switcher'):
             self.assertEqual(after['model_providers'][provider_id], dict(
@@ -92,14 +92,57 @@ base_url = "https://other.example/v1"
                 after = _parse(_new_config(b'', profile, 'catalog.json'))
                 self.assertEqual(after['model_reasoning_effort'], 'low' if effort == 'light' else effort)
                 self.assertEqual(after['model_catalog_json'], 'catalog.json')
-                self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
+                self.assertNotIn('conversationDetailMode', after)
                 self.assertEqual(after['agents']['default_subagent_reasoning_effort'], 'max')
         profile = {key: value for key, value in self.profile.items() if key != 'reasoning_effort'}
         self.assertEqual(_parse(_new_config(b'', profile))['model_reasoning_effort'], 'high')
 
-    def test_conversation_detail_mode_is_written_without_catalog(self):
+    def test_conversation_detail_mode_is_not_written_without_catalog(self):
         after = _parse(_new_config(b'', self.profile))
-        self.assertEqual(after['conversationDetailMode'], 'STEPS_COMMANDS')
+        self.assertNotIn('conversationDetailMode', after)
+
+    def test_switch_enables_auto_review_when_approval_settings_are_missing(self):
+        after = _parse(_new_config(b'', self.profile))
+        self.assertEqual(after['sandbox_mode'], 'danger-full-access')
+        self.assertEqual(after['approval_policy'], 'on-request')
+        self.assertEqual(after['approvals_reviewer'], 'auto_review')
+
+    def test_auto_review_replaces_workspace_sandbox_and_preserves_other_settings(self):
+        original = b'''# preserve this comment
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+approvals_reviewer = "user"
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["D:/example"]
+[auto_review]
+extra_policy = "Keep this policy."
+[apps.example]
+approvals_reviewer = "user"
+[mcp_servers.example]
+command = "example-tool"
+'''.replace(b'\n', b'\r\n')
+        result = _new_config(original, self.profile)
+        after = _parse(result)
+        self.assertEqual(after['sandbox_mode'], 'danger-full-access')
+        self.assertEqual(after['approval_policy'], 'on-request')
+        self.assertEqual(after['approvals_reviewer'], 'auto_review')
+        for key in ('sandbox_workspace_write', 'auto_review', 'apps', 'mcp_servers'):
+            self.assertEqual(after[key], _parse(original)[key])
+        self.assertIn(b'# preserve this comment\r\n', result)
+        self.assertEqual(_parse(_new_config(result, self.profile)), after)
+
+    def test_auto_review_replaces_inline_and_table_granular_approval_policies(self):
+        for policy in (
+            b'approval_policy = { granular = { sandbox_approval = false, rules = true } }\n',
+            b'[approval_policy.granular]\nsandbox_approval = false\nrules = true\n',
+        ):
+            with self.subTest(policy=policy):
+                original = policy + b'[mcp_servers.example]\ncommand = "keep-tool"\n'
+                after = _parse(_new_config(original, self.profile))
+                self.assertEqual(after['approval_policy'], 'on-request')
+                self.assertEqual(after['approvals_reviewer'], 'auto_review')
+                self.assertEqual(after['mcp_servers'], _parse(original)['mcp_servers'])
 
     def test_auto_review_model_is_saved_per_station_and_cleared_on_connection_change(self):
         with (TemporaryDirectory() as temporary,
@@ -142,6 +185,9 @@ base_url = "https://other.example/v1"
             catalog_path = Path(config['model_catalog_json'])
             catalog = json.loads(catalog_path.read_text(encoding='utf-8'))
             self.assertEqual(config['model'], 'main-model')
+            self.assertEqual(config['sandbox_mode'], 'danger-full-access')
+            self.assertEqual(config['approval_policy'], 'on-request')
+            self.assertEqual(config['approvals_reviewer'], 'auto_review')
             self.assertEqual({item['auto_review_model_override'] for item in catalog['models']},
                              {'review-model'})
 
@@ -368,6 +414,9 @@ class SubagentReasoningTests(unittest.TestCase):
     def test_switch_uses_saved_subagent_choice_and_restore_recovers_exact_config(self):
         original = chr(10).join([
             '# original settings', 'model = "original-model"',
+            'conversationDetailMode = "STEPS_COMMANDS"',
+            'sandbox_mode = "danger-full-access"', 'approval_policy = "never"',
+            'approvals_reviewer = "user"',
             '[agents]', 'max_threads = 3',
             'default_subagent_reasoning_effort = "medium"',
             '[mcp_servers.existing]', 'command = "keep-existing"', '',
@@ -382,6 +431,10 @@ class SubagentReasoningTests(unittest.TestCase):
         self.assertEqual(config['agents'],
                          {'max_threads': 3, 'default_subagent_reasoning_effort': 'low'})
         self.assertEqual(config['model_reasoning_effort'], 'high')
+        self.assertNotIn('conversationDetailMode', config)
+        self.assertEqual(config['sandbox_mode'], 'danger-full-access')
+        self.assertEqual(config['approval_policy'], 'on-request')
+        self.assertEqual(config['approvals_reviewer'], 'auto_review')
         self.assertEqual(config['mcp_servers'], _parse(original)['mcp_servers'])
         self.assertEqual(manager.current()['subagent_reasoning_effort'], 'light')
         manager.restore()

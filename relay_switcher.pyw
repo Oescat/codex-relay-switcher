@@ -526,7 +526,7 @@ class Switcher(tk.Tk):
                                         command=self.switch)
         self.switch_button.pack(side="right")
         note = ttk.Label(main, text="应用后请完全退出并重开 Codex；全局默认设置与旧中转入口会同步更新。子代理模型可留空，强度默认 max；light 对应 low。\n"
-                         "Auto Review 模型用于此站点全部主模型；留空使用默认选择。此设置不会启用 Auto Review，也不影响 /review。",
+                         "写入全盘访问与自动审批默认值；重开后选择“自定义（config.toml）”。审核模型留空使用默认选择，不影响 /review。",
                          style="Muted.TLabel")
         note.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.wrap_label(note, main)
@@ -1070,8 +1070,10 @@ class Switcher(tk.Tk):
             self.status.set(f"已更新“{name}”的全局配置，同步 {len(provider_ids)} 个中转入口；请重开 Codex。")
             messagebox.showinfo("全局配置已更新", f"已将“{name}”应用到 Codex 全局配置。\n"
                                 f"同步了 {len(provider_ids)} 个中转入口，旧入口也已改用所选站点。\n\n"
+                                "已写入全盘访问和自动审批默认值。\n"
                                 "正在运行的对话可能仍保留旧连接。\n"
-                                "请完全退出 Codex，再重新打开已有或新对话。\n"
+                                "请完全退出并重开 Codex，在对话权限菜单选择“自定义（config.toml）”。\n"
+                                "Full Access 预设会选回 never；请检查对话实际配置。\n"
                                 "重开后，Codex 下拉框会包含此站点已获取的全部模型。\n"
                                 "所选模型作为默认；其他模型可直接在 Codex 中选择。\n\n"
                                 "原配置已备份，可用“恢复上次配置”撤回。", parent=self)
