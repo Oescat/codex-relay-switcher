@@ -107,6 +107,28 @@ base_url = "https://other.example/v1"
         self.assertEqual(after['approval_policy'], 'on-request')
         self.assertEqual(after['approvals_reviewer'], 'auto_review')
 
+    def test_web_search_defaults_to_live(self):
+        self.assertEqual(_parse(_new_config(b'', self.profile))['web_search'], 'live')
+
+    def test_web_search_replaces_existing_mode_and_preserves_search_options(self):
+        for mode in ('cached', 'disabled', 'indexed', 'live'):
+            with self.subTest(mode=mode):
+                original = (f'web_search = "{mode}"\r\n'
+                            '# keep search options\r\n'
+                            '[tools.web_search]\r\n'
+                            'context_size = "medium"\r\n'
+                            '[features]\r\n'
+                            'web_search_cached = true\r\n'
+                            '[apps.example]\r\n'
+                            'web_search = "disabled"\r\n').encode()
+                result = _new_config(original, self.profile)
+                after = _parse(result)
+                self.assertEqual(after['web_search'], 'live')
+                for key in ('tools', 'features', 'apps'):
+                    self.assertEqual(after[key], _parse(original)[key])
+                self.assertIn(b'# keep search options\r\n', result)
+                self.assertEqual(_parse(_new_config(result, self.profile)), after)
+
     def test_auto_review_replaces_workspace_sandbox_and_preserves_other_settings(self):
         original = b'''# preserve this comment
 sandbox_mode = "workspace-write"
@@ -417,6 +439,7 @@ class SubagentReasoningTests(unittest.TestCase):
             'conversationDetailMode = "STEPS_COMMANDS"',
             'sandbox_mode = "danger-full-access"', 'approval_policy = "never"',
             'approvals_reviewer = "user"',
+            'web_search = "cached"',
             '[agents]', 'max_threads = 3',
             'default_subagent_reasoning_effort = "medium"',
             '[mcp_servers.existing]', 'command = "keep-existing"', '',
@@ -435,6 +458,7 @@ class SubagentReasoningTests(unittest.TestCase):
         self.assertEqual(config['sandbox_mode'], 'danger-full-access')
         self.assertEqual(config['approval_policy'], 'on-request')
         self.assertEqual(config['approvals_reviewer'], 'auto_review')
+        self.assertEqual(config['web_search'], 'live')
         self.assertEqual(config['mcp_servers'], _parse(original)['mcp_servers'])
         self.assertEqual(manager.current()['subagent_reasoning_effort'], 'light')
         manager.restore()

@@ -11,6 +11,55 @@ from unittest.mock import patch
 
 
 class RelayCatalogAutoReviewTests(unittest.TestCase):
+    def test_template_only_entries_include_legacy_instructions_without_changing_source(self):
+        for base in ('missing', None):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                entry = relay_catalog._fallback('template-model')
+                entry.pop('base_instructions')
+                if base is None:
+                    entry['base_instructions'] = None
+                entry['model_messages'] = {
+                    'instructions_template': 'Official model instructions. Keep {literal} examples.',
+                    'tools': {'synthetic': 'Preserve modern tool instructions.'},
+                }
+                source = home / 'custom.json'
+                original = json.dumps({'models': [entry]}).encode('utf-8')
+                source.write_bytes(original)
+                generated = write_model_catalog(
+                    home, {'model_catalog_json': str(source)}, [], 'template-model')
+                actual = json.loads(generated.read_text(encoding='utf-8'))['models'][0]
+                self.assertEqual(actual['base_instructions'], entry['model_messages']['instructions_template'])
+                self.assertEqual(actual['model_messages'], entry['model_messages'])
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_existing_base_instructions_are_preserved_with_modern_messages(self):
+        for base in ('Existing model instructions.', ''):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                entry = relay_catalog._fallback('both-formats')
+                entry['base_instructions'] = base
+                entry['model_messages'] = {'instructions_template': 'Different modern instructions.'}
+                source = home / 'custom.json'
+                source.write_text(json.dumps({'models': [entry]}), encoding='utf-8')
+                generated = write_model_catalog(
+                    home, {'model_catalog_json': str(source)}, [], 'both-formats')
+                actual = json.loads(generated.read_text(encoding='utf-8'))['models'][0]
+                self.assertEqual(actual['base_instructions'], base)
+                self.assertEqual(actual['model_messages'], entry['model_messages'])
+
+    def test_bundled_models_generate_both_instruction_formats(self):
+        entries = relay_catalog._read_models(relay_catalog.BUNDLED_CATALOG)
+        models = [entry['slug'] for entry in entries]
+        with tempfile.TemporaryDirectory() as temporary:
+            generated = write_model_catalog(Path(temporary), {}, models, models[0])
+            actual = json.loads(generated.read_text(encoding='utf-8'))['models']
+            self.assertEqual(len(actual), len(entries))
+            for source, result in zip(entries, actual):
+                self.assertIsInstance(result['base_instructions'], str)
+                if isinstance(source.get('model_messages'), dict):
+                    self.assertEqual(result['model_messages'], source['model_messages'])
+
     def test_reasoning_choices_follow_the_same_catalog_as_written_models(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

@@ -541,6 +541,16 @@ class ImageRelayManager:
         raise RelayError("图片中转站不存在，请刷新列表。")
 
     @_safe
+    def canvas_connection(self):
+        """Read the applied image connection atomically, independently of MCP enablement."""
+        with self._locked():
+            profiles, settings = self._load()
+            profile = next((item for item in profiles if item["id"] == settings["active_id"]), None)
+            if profile is None or not profile["api_key"]:
+                return None
+            return {"name": profile["name"], "baseUrl": profile["base_url"], "apiKey": profile["api_key"]}
+
+    @_safe
     def save_profile(self, name, base_url, api_key, model="", profile_id=None, models=None,
                      reasoning_effort=None):
         profile = _validate_profile(name, base_url, api_key, model)

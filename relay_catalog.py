@@ -229,6 +229,10 @@ def write_model_catalog(home: Path, config: dict, models: list[str], default_mod
         entries = []
         for priority, model in enumerate(ordered):
             entry = resolved.get(model) or _fallback(model)
+            # Older Codex clients require this field even when modern model
+            # messages provide the instructions. Keep both formats intact.
+            if not isinstance(entry.get('base_instructions'), str):
+                entry['base_instructions'] = entry['model_messages']['instructions_template']
             # Every fetched option must be visible, while the chosen default
             # sorts first. Avoid upgrades that would suggest an unlisted model.
             entry.update(visibility='list', supported_in_api=True, priority=priority, upgrade=None,

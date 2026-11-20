@@ -80,15 +80,20 @@ python relay_switcher.pyw
 
 使用显式外部模型目录时，生成目录旁的 `.source.json` 记录原始目录路径，防止应用后丢失来源；再次读取时仍读取原始目录的更新。该记录不含密钥。旧版本生成的目录没有来源记录，无法仅凭生成内容重建原始来源，需要重新指定原始目录。
 
+生成模型目录时会保留新版 `model_messages`，并为缺少 `base_instructions` 的条目从原始指令模板补齐该字段，供仍要求旧格式的 CLI 使用。已有的 `base_instructions` 保持原样；旧版 Switcher 已生成的目录需要重新应用后才会更新。
+
 **语言模型配置切换或恢复后，需要重开 Codex。** 已经运行的对话可能仍保留旧配置或连接。
 
-点击 **应用为全局中转站** 时，同时写入以下全局默认设置，并替换配置文件中原来的 `sandbox_mode`、`approval_policy` 和 `approvals_reviewer`：
+点击 **应用为全局中转站** 时，同时写入以下全局默认设置，并替换配置文件中原来的 `sandbox_mode`、`approval_policy`、`approvals_reviewer` 和 `web_search`：
 
 ```toml
 sandbox_mode = "danger-full-access"
 approval_policy = "on-request"
 approvals_reviewer = "auto_review"
+web_search = "live"
 ```
+
+`web_search = "live"` 明确选择实时网页搜索，替换原来的缓存或禁用设置。重开 Codex 后，在“用户配置”中检查“网页搜索”是否显示“实时”；中转站能否实际执行搜索仍需验证。恢复上次配置时，也会恢复原来的搜索设置。仅应用生图配置不会修改网页搜索方式。
 
 这组设置保留全盘文件访问，并为需要审批的操作启用 Auto Review。`danger-full-access` 不要求审批策略只能是 `never`；桌面端名称为 **Full Access** 的固定预设才使用 `never`。
 
@@ -127,6 +132,27 @@ Canva 继续通过已安装的 Canva 插件使用：对话中的文字模型负�
 修改当前生图站点的地址、密钥或模型会先关闭生图，需要重新应用或启用。关闭 Switcher 窗口不会停止 MCP 服务；关闭生图开关后，工具仍保留注册，但会拒绝新的生图请求。
 
 MCP 注册使用程序与 Python 的绝对路径。移动目录或更换 Python 后，重新应用可更新本程序的旧注册，并在注册发生变化时重开 Codex。重新应用会保留 Codex 添加的工具设置、环境变量与自定义超时；同名但指向其他程序或其他 Codex 配置目录的注册仍会报冲突。
+
+## 本地 Infinite Canvas 同步
+
+完整交接记录见 [适配 Infinite Canvas 的说明](INFINITE_CANVAS_ADAPTATION.md)，包含问题原因、修复、补丁应用、新电脑配置和未解决事项。Canvas 是独立安装的软件，本包不包含 Canvas 本体、画布数据或任何授权。
+
+可选认证入口是 integrations/repair-canvas-mcp-auth.ps1。Canva 重新授权曾恢复 ready；GitHub OAuth 登录退出成功后，实际 MCP 仍要求 PAT，最终通过本机环境变量引用恢复 ready。因此脚本的 -Server github 仅发起 OAuth，不保证解决 PAT 分支。新电脑需自行授权，不能复制原电脑令牌；切换 CLI 也不能替代第三方登录。
+
+已为本机 `D:\AI-Tools\Infinite-Canvas` 的本地开发服务增加图片渠道同步，适配补丁保存在 `integrations/infinite-canvas.patch`。此功能仅用于本地版，不作用于 `canvas.best` 在线版，也不转发图片请求。
+
+1. 在 Switcher 的 **生图中转** 页面选择站点并点击 **应用**。
+2. 刷新本地 Canvas，在 **配置 → 渠道** 中找到 **Switcher 生图 · 站点名称**。
+3. 首次在这个渠道内手动添加图片模型，标记为 **生图**，再在 Canvas 选择使用。模型、调用脚本、画质、尺寸和张数仍由 Canvas 管理，不从 Switcher 复制。
+4. 以后在 Switcher 应用其他图片站点，专用渠道的地址和密钥自动更新，Canvas 中原有模型和其他渠道保留。每次通过这个渠道生图、参考图编辑或获取模型列表前，还会重新读取连接信息；读取失败会阻止本次请求，不沿用旧密钥。
+
+同步读取的是已应用的图片站点，不是语言模型站点；仅选中列表而未应用不会切换渠道。修改当前图片站点的连接信息后也会更新。Switcher 的 MCP 生图开关只控制该 MCP，不关闭 Canvas 的直接请求；Canvas 生成结果仍按 Canvas 的方式保存，不自动写入 `D:\codex-\image`。
+
+本地网页启动时通过 Python 私有管道读取当前用户的图片配置，使用同源、禁止缓存的接口传给浏览器；不把密钥放入 URL、日志或 Git。Canvas 会像手工配置一样，将地址和密钥持久化到当前浏览器本地，这与 Switcher 原有的 DPAPI 加密存储是两份数据。
+
+本机适配默认读取 `D:\Switch api` 中的辅助入口及默认 Codex 配置目录。如安装位置、Python 或 Codex 配置目录不同，在启动本地网页前分别设置非密钥环境变量 `RELAY_SWITCHER_ROOT`、`RELAY_SWITCHER_PYTHON`、`RELAY_SWITCHER_HOME`。此适配依赖本地 Vite 开发服务，上游升级或改用静态部署时需要重新处理补丁。不要在终端手动运行辅助入口的连接输出模式，以免显示密钥。
+
+本机 Canvas 聊天侧栏按画布 ID 保存独立对话：打开或切换画布时自动恢复对应聊天，首次打开没有绑定的画布时创建空对话；“新对话”只影响当前画布，旧聊天保留在该画布的历史中。已有共享对话的归属应由用户指定，本包不含私人线程绑定。已有消息的对话恢复失败时保留原记录；确认未发送消息、尚未落盘的空对话可以自动重建。Agent 仍同时只运行一个任务，进行中的任务不会改到其他画布；切换后需等待原任务结束及 MCP 初始化。
 
 ## 配置与密钥保存在哪里
 

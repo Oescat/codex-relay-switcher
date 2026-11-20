@@ -292,6 +292,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             if ('model_provider' in entry or (profile['model'] and 'model' in entry)
                     or 'model_reasoning_effort' in entry
                     or 'conversationDetailMode' in entry
+                    or 'web_search' in entry
                     or any(key in entry for key in approval_settings)
                     or (catalog_path is not None and 'model_catalog_json' in entry)):
                 continue
@@ -305,6 +306,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
         prefix += 'model_reasoning_effort = ' + _quote(_CODEX_REASONING_EFFORTS[reasoning_effort]) + newline
     for key, value in approval_settings.items():
         prefix += key + ' = ' + _quote(value) + newline
+    prefix += 'web_search = "live"' + newline
     if catalog_path is not None:
         prefix += 'model_catalog_json = ' + _quote(str(catalog_path)) + newline
     provider = ''.join(newline.join(('[model_providers.' + _quote(provider_id) + ']',
@@ -327,6 +329,7 @@ def _new_config(original, profile, catalog_path=None, provider_ids=None):
             value.pop('model', None)
         value.pop('model_reasoning_effort', None)
         value.pop('conversationDetailMode', None)
+        value.pop('web_search', None)
         for key in approval_settings:
             value.pop(key, None)
         if catalog_path is not None:

@@ -1,0 +1,1261 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5e51bff..989b24f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## Unreleased
+ 
+++ [调整] 本机 Windows Agent 优先使用桌面端 Codex CLI，并允许显式指定执行文件，减少旧依赖与已安装插件认证字段不兼容的问题。
+++ [新增] 本地 Agent 按画布独立保存和恢复 Codex 对话，切换画布自动切换聊天并限制跨画布工具操作。
+++ [修复] Codex 分页线程通过分页接口恢复聊天历史，避免旧对话初始化失败。
+++ [新增] 本机开发版可跟随 Switcher 已应用的图片渠道地址和密钥，保留 Canvas 模型选择并在图片请求前刷新连接。
++
+ ## v0.20.0 - 2026-10-10
+ 
+ + [修复] 已选模型或所属渠道被移除时保留原选择并阻止生成及视频任务查询，避免静默切换到默认模型或其他渠道。
+diff --git a/canvas-agent/README.md b/canvas-agent/README.md
+index 1d91b94..01c8dd1 100644
+--- a/canvas-agent/README.md
++++ b/canvas-agent/README.md
+@@ -4,6 +4,8 @@
+ 
+ ## 启动
+ 
++本机 Windows 适配优先使用 PATH 中桌面端安装的 Codex CLI，避免固定旧 npm 版本误读插件认证字段；找不到时使用项目依赖。可将 CANVAS_CODEX_PATH 设置为现有 Codex 可执行文件或 Node 入口的绝对路径。切换只在下次启动 Canvas 的 Codex 子进程时生效，第三方 MCP 登录仍需用户完成。
++
+ ```bash
+ npx -y @basketikun/canvas-agent@latest
+ ```
+diff --git a/canvas-agent/src/agent/codex-client.test.ts b/canvas-agent/src/agent/codex-client.test.ts
+index 11d2d03..09bdcae 100644
+--- a/canvas-agent/src/agent/codex-client.test.ts
++++ b/canvas-agent/src/agent/codex-client.test.ts
+@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
+ import test from "node:test";
+ 
+ import { CodexAppClient } from "./codex-client.js";
++import { threadMessages } from "./codex-history.js";
+ import { assertDraftHasNoSensitiveValues, canvasSkillSource } from "./codex.js";
+ 
+ type TestClient = {
+@@ -19,6 +20,96 @@ type TestClient = {
+ 
+ const emptyEventHistory = { record: () => Promise.resolve(), recordTurn: () => Promise.resolve() };
+ 
++test("分页线程按原顺序读全多页轮次和各轮消息", async () => {
++    const client = Reflect.construct(CodexAppClient, [{}, () => undefined, emptyEventHistory]) as CodexAppClient;
++    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
++    const replies = [
++        new Error("paginated threads do not support thread/read(includeTurns=true)"),
++        { thread: { id: "thread-1", cwd: "D:\\site", name: "保留名称" } },
++        { data: [{ id: "turn-1", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: "turn-page-2" },
++        { data: [{ id: "turn-2", status: "failed", error: { message: "synthetic failure" }, durationMs: 50 }], nextCursor: null },
++        { data: [{ turnId: "turn-1", item: { id: "user-1", type: "userMessage", content: [{ type: "text", text: "旧提示词" }] } }], nextCursor: "item-page-2" },
++        { data: [{ turnId: "turn-1", item: { id: "assistant-1", type: "agentMessage", text: "旧回答" } }], nextCursor: null },
++        { data: [{ turnId: "turn-2", item: { id: "tool-1", type: "mcpToolCall" } }], nextCursor: null },
++    ];
++    Object.assign(client, { request: async (method: string, params: Record<string, unknown>) => {
++        calls.push({ method, params });
++        const reply = replies.shift();
++        if (reply instanceof Error) throw reply;
++        assert.ok(reply, "不应额外请求或自动重试");
++        return reply;
++    } });
++    const { thread } = await client.readThread("thread-1");
++    assert.equal(thread.name, "保留名称");
++    assert.deepEqual(thread.turns?.map((turn) => turn.id), ["turn-1", "turn-2"]);
++    assert.deepEqual((thread.turns?.[0].items as Array<{ id: string }>).map((item) => item.id), ["user-1", "assistant-1"]);
++    assert.equal(thread.turns?.[1].error?.message, "synthetic failure");
++    assert.equal(thread.turns?.[1].durationMs, 50);
++    assert.deepEqual(threadMessages(thread).filter((message) => message.role === "user" || message.role === "assistant").map(({ role, text }) => ({ role, text })), [
++        { role: "user", text: "旧提示词" },
++        { role: "assistant", text: "旧回答" },
++    ]);
++    assert.deepEqual(calls.map(({ method }) => method), ["thread/read", "thread/read", "thread/turns/list", "thread/turns/list", "thread/items/list", "thread/items/list", "thread/items/list"]);
++    assert.equal(calls[2].params.itemsView, "notLoaded");
++    assert.equal(calls[3].params.cursor, "turn-page-2");
++    assert.equal(calls[5].params.cursor, "item-page-2");
++    assert.ok(calls.slice(2).every(({ params }) => params.sortDirection === "asc"));
++    assert.equal(replies.length, 0);
++});
++
++test("非分页线程和仅元数据读取保留原生响应", async () => {
++    for (const includeTurns of [true, false]) {
++        const client = Reflect.construct(CodexAppClient, [{}, () => undefined, emptyEventHistory]) as CodexAppClient;
++        const response = { thread: { id: "legacy-thread", cwd: "D:\\site", turns: [] } };
++        let requests = 0;
++        Object.assign(client, { request: async (method: string, params: Record<string, unknown>) => {
++            requests += 1;
++            assert.equal(method, "thread/read");
++            assert.deepEqual(params, { threadId: "legacy-thread", includeTurns });
++            return response;
++        } });
++        assert.equal(await client.readThread("legacy-thread", includeTurns), response);
++        assert.equal(requests, 1);
++    }
++});
++
++test("历史读取的其他错误不会被分页兼容逻辑吞掉", async () => {
++    const client = Reflect.construct(CodexAppClient, [{}, () => undefined, emptyEventHistory]) as CodexAppClient;
++    const error = new Error("synthetic permission failure");
++    let requests = 0;
++    Object.assign(client, { request: async () => { requests += 1; throw error; } });
++    await assert.rejects(client.readThread("thread-1"), (actual: unknown) => actual === error);
++    assert.equal(requests, 1);
++});
++
++test("分页消息读取失败或归属异常时拒绝返回部分历史", async () => {
++    for (const entry of [new Error("synthetic item failure"), { data: [{ turnId: "other-thread-turn", item: { id: "wrong", type: "agentMessage" } }], nextCursor: null }]) {
++        const client = Reflect.construct(CodexAppClient, [{}, () => undefined, emptyEventHistory]) as CodexAppClient;
++        const replies = [new Error("paginated threads do not support thread/read(includeTurns=true)"), { thread: { id: "thread-1" } }, { data: [{ id: "turn-1" }], nextCursor: null }, entry];
++        Object.assign(client, { request: async () => { const response = replies.shift(); if (response instanceof Error) throw response; return response; } });
++        await assert.rejects(client.readThread("thread-1"), /synthetic item failure|归属不一致/);
++        assert.equal(replies.length, 0);
++    }
++});
++
++test("分页游标重复时停止而不截断或无限循环", async () => {
++    for (const repeatItems of [false, true]) {
++        const client = Reflect.construct(CodexAppClient, [{}, () => undefined, emptyEventHistory]) as CodexAppClient;
++        let requests = 0;
++        const expectedRequests = repeatItems ? 5 : 4;
++        Object.assign(client, { request: async () => {
++            requests += 1;
++            if (requests === 1) throw new Error("paginated threads do not support thread/read(includeTurns=true)");
++            if (requests === 2) return { thread: { id: "thread-1" } };
++            if (repeatItems && requests === 3) return { data: [{ id: "turn-1" }], nextCursor: null };
++            assert.ok(requests <= expectedRequests, "不能无限读取重复游标");
++            return { data: [], nextCursor: "repeated" };
++        } });
++        await assert.rejects(client.readThread("thread-1"), /分页游标未推进/);
++        assert.equal(requests, expectedRequests);
++    }
++});
++
+ test("审批只在 app-server 确认 resolved 后清除", () => {
+     const writes: Array<Record<string, unknown>> = [];
+     const events: Array<{ type: string; payload: unknown }> = [];
+diff --git a/canvas-agent/src/agent/codex-client.ts b/canvas-agent/src/agent/codex-client.ts
+index 97e8dac..1d03f25 100644
+--- a/canvas-agent/src/agent/codex-client.ts
++++ b/canvas-agent/src/agent/codex-client.ts
+@@ -1,4 +1,5 @@
+ import { spawn, type ChildProcess } from "node:child_process";
++import { existsSync } from "node:fs";
+ import { createRequire } from "node:module";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+@@ -67,8 +68,9 @@ export class CodexAppClient {
+ 
+     /** 启动并初始化 Codex app-server。 */
+     static async start(emit: AgentEmit, onExit: () => void) {
+-        logger.info("Starting Codex app-server", { executable: process.execPath, codex: codexBin() });
+-        const child = spawn(process.execPath, [codexBin(), "app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
++        const launch = codexCommand();
++        logger.info("Starting Codex app-server", { executable: launch.command });
++        const child = spawn(launch.command, [...launch.args, "app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+         const client = new CodexAppClient(child, emit);
+         let stopped = false;
+         const stop = () => {
+@@ -159,9 +161,42 @@ export class CodexAppClient {
+         return this.request("thread/list", params);
+     }
+ 
+-    /** 读取指定 Codex 线程。 */
+-    readThread(threadId: string, includeTurns = true) {
+-        return this.request("thread/read", { threadId, includeTurns });
++    /** 读取完整历史；分页线程分别读取全部轮次和消息，不截断旧内容。 */
++    async readThread(threadId: string, includeTurns = true) {
++        try {
++            return await this.request("thread/read", { threadId, includeTurns });
++        } catch (error) {
++            if (!includeTurns || !(error instanceof Error) || !error.message.includes("paginated threads do not support thread/read(includeTurns=true)")) throw error;
++        }
++        const result = await this.request("thread/read", { threadId, includeTurns: false });
++        const turns: CodexRequestResult<"thread/turns/list">["data"] = [];
++        let cursor: string | undefined;
++        const turnCursors = new Set<string>();
++        do {
++            const page = await this.request("thread/turns/list", { threadId, sortDirection: "asc", itemsView: "notLoaded", ...(cursor ? { cursor } : {}) });
++            turns.push(...page.data);
++            cursor = page.nextCursor || undefined;
++            if (cursor && turnCursors.has(cursor)) throw new Error("Codex 历史轮次分页游标未推进，已停止读取以避免返回不完整历史");
++            if (cursor) turnCursors.add(cursor);
++        } while (cursor);
++        for (const turn of turns) {
++            const items: CodexRequestResult<"thread/items/list">["data"][number]["item"][] = [];
++            const itemCursors = new Set<string>();
++            cursor = undefined;
++            do {
++                const page = await this.request("thread/items/list", { threadId, turnId: turn.id, sortDirection: "asc", ...(cursor ? { cursor } : {}) });
++                for (const entry of page.data) {
++                    if (entry.turnId !== turn.id) throw new Error("Codex 历史消息归属不一致，已停止读取");
++                    items.push(entry.item);
++                }
++                cursor = page.nextCursor || undefined;
++                if (cursor && itemCursors.has(cursor)) throw new Error("Codex 历史消息分页游标未推进，已停止读取以避免返回不完整历史");
++                if (cursor) itemCursors.add(cursor);
++            } while (cursor);
++            turn.items = items;
++            turn.itemsView = "full";
++        }
++        return { ...result, thread: { ...result.thread, turns } };
+     }
+ 
+     /** 归档指定 Codex 线程。 */
+@@ -894,7 +929,19 @@ function parseMaybeJson(value: unknown) {
+     }
+ }
+ 
+-/** 定位当前依赖中 Codex CLI 的执行文件。 */
+-function codexBin() {
+-    return path.join(path.dirname(require.resolve("@openai/codex/package.json")), "bin", "codex.js");
++/** 优先使用显式指定或桌面端的 CLI，避免旧依赖误读已安装插件的认证配置。 */
++function codexCommand() {
++    const override = process.env.CANVAS_CODEX_PATH?.trim();
++    if (override) {
++        if (!path.isAbsolute(override) || !existsSync(override)) throw new Error("CANVAS_CODEX_PATH 必须指向已有的 Codex 可执行文件");
++        return /\.(?:m?js|cjs)$/i.test(override) ? { command: process.execPath, args: [override] } : { command: override, args: [] };
++    }
++    if (process.platform === "win32") {
++        const desktop = Object.entries(process.env).filter(([key]) => key.toLowerCase() === "path")
++            .flatMap(([, value]) => (value || "").split(path.delimiter))
++            .map((entry) => path.join(entry.replace(/^"|"$/g, ""), "codex.exe"))
++            .find((entry) => entry.toLowerCase().includes((path.join("OpenAI", "Codex", "bin") + path.sep).toLowerCase()) && existsSync(entry));
++        if (desktop) return { command: desktop, args: [] };
++    }
++    return { command: process.execPath, args: [path.join(path.dirname(require.resolve("@openai/codex/package.json")), "bin", "codex.js")] };
+ }
+diff --git a/canvas-agent/src/agent/codex-protocol.ts b/canvas-agent/src/agent/codex-protocol.ts
+index 3cb4055..a56eef3 100644
+--- a/canvas-agent/src/agent/codex-protocol.ts
++++ b/canvas-agent/src/agent/codex-protocol.ts
+@@ -92,6 +92,14 @@ type CodexRequestSpec = {
+         params: { threadId: string; includeTurns: boolean };
+         result: { thread: CodexThread };
+     };
++    "thread/turns/list": {
++        params: { threadId: string; cursor?: string; sortDirection: "asc"; itemsView: "notLoaded" };
++        result: { data: CodexTurn[]; nextCursor: string | null };
++    };
++    "thread/items/list": {
++        params: { threadId: string; turnId: string; cursor?: string; sortDirection: "asc" };
++        result: { data: Array<{ turnId: string; item: CodexItem }>; nextCursor: string | null };
++    };
+     "thread/archive": {
+         params: { threadId: string };
+         result: Record<string, never>;
+diff --git a/canvas-agent/src/agent/codex.ts b/canvas-agent/src/agent/codex.ts
+index d57c4e4..26ead39 100644
+--- a/canvas-agent/src/agent/codex.ts
++++ b/canvas-agent/src/agent/codex.ts
+@@ -103,7 +103,11 @@ export async function resumeCodexThread(emit: AgentEmit, threadId: string, cwd?:
+ }
+ 
+ /** 查询当前工作空间中的 Codex 线程。 */
+-export async function listCodexThreads(emit: AgentEmit, options: { cwd: string; searchTerm?: string; limit?: number }) {
++export async function listCodexThreads(emit: AgentEmit, options: { cwd: string; searchTerm?: string; limit?: number; threadIds?: string[] }) {
++    if (options.threadIds) {
++        const data = await Promise.all(options.threadIds.map(async (id) => summarizeCodexThread(await loadCodexThread(emit, id, options.cwd, false))));
++        return { data, nextCursor: null, backwardsCursor: null };
++    }
+     const app = await getCodexApp(emit);
+     const result = await app.listThreads({
+         limit: options.limit || 40,
+diff --git a/canvas-agent/src/canvas/session.test.ts b/canvas-agent/src/canvas/session.test.ts
+index 7c4dd55..2120b2a 100644
+--- a/canvas-agent/src/canvas/session.test.ts
++++ b/canvas-agent/src/canvas/session.test.ts
+@@ -223,7 +223,7 @@ test("new clients receive the current Codex state and later updates", (t) => {
+     const hello = client.event("hello");
+     assert.equal(field(hello, "protocolVersion"), 6);
+     assert.deepEqual(field(hello, "workspace"), { activeThreadId: "thread-2" });
+-    assert.deepEqual(field(hello, "conversation"), { revision: 1, conversationId: "thread-2", threadId: "thread-2", status: "ready", mcpStatuses: {} });
++    assert.deepEqual(field(hello, "conversation"), { canvasId: "", revision: 1, conversationId: "thread-2", threadId: "thread-2", status: "ready", mcpStatuses: {} });
+     assert.deepEqual(field(hello, "codex"), { busy: true, threadId: "thread-2", turnId: "turn-1" });
+     assert.deepEqual(field(hello, "pendingApprovals"), [{ requestId: "approval-1", threadId: "thread-2" }]);
+ 
+@@ -375,8 +375,8 @@ test("a disconnected bound client never falls back and can resume with the same
+ 
+     const reconnected = connect(session, "first");
+     t.after(() => reconnected.close());
+-    session.updateState(snapshot("canvas-first-reconnected"), "first");
+-    assert.equal(field(await session.callTool("canvas_get_state", {}), "projectId"), "canvas-first-reconnected");
++    session.updateState(snapshot("canvas-first"), "first");
++    assert.equal(field(await session.callTool("canvas_get_state", {}), "projectId"), "canvas-first");
+ 
+     const result = session.callTool("canvas_create_text_node", { text: "reconnected" });
+     const call = reconnected.event("tool_call");
+@@ -531,6 +531,37 @@ test("切换活动线程会清除上一线程的实时快照", (t) => {
+ });
+ 
+ /** 创建用于测试的画布 SSE 连接。 */
++test("运行任务固定画布，切换后不能读取或写入另一画布", async (t) => {
++    const session = new CanvasSession("thread-a", "canvas-a");
++    const client = connect(session, "first");
++    t.after(() => client.close());
++    session.updateState(snapshot("canvas-a"), "first");
++    session.bindClient("first");
++    session.updateState(snapshot("canvas-b"), "first");
++    await assert.rejects(session.callTool("canvas_get_state", {}), /没有已连接画布/);
++    await assert.rejects(session.callTool("canvas_create_text_node", { text: "不应写到 B" }), /所属画布已切换/);
++    assert.equal(client.event("tool_call"), undefined);
++    session.releaseClient("first");
++    assert.equal(field(await session.callTool("canvas_get_state", {}), "projectId"), "canvas-b");
++});
++
++test("工具结果必须回到发起时的画布，状态保留画布归属", async (t) => {
++    const session = new CanvasSession("thread-a", "canvas-a");
++    const client = connect(session, "first");
++    t.after(() => client.close());
++    session.updateState(snapshot("canvas-a"), "first");
++    session.bindClient("first");
++    const pending = session.callTool("canvas_create_text_node", { text: "只属于 A" });
++    const rejected = assert.rejects(pending, /已拒绝其他画布/);
++    const event = client.event("tool_call");
++    assert.equal(field(event, "projectId"), "canvas-a");
++    session.updateState(snapshot("canvas-b"), "first");
++    assert.equal(session.resolveResult("first", { requestId: String(field(event, "requestId")), result: {} }), false);
++    await rejected;
++    session.beginConversation({ canvasId: "canvas-b", threadId: "thread-b" });
++    assert.equal(session.conversationStateSnapshot.canvasId, "canvas-b");
++});
++
+ function connect(session: CanvasSession, clientId: string, activeThreadId = "") {
+     const response = new FakeSseResponse();
+     session.openEvents(new URL(`http://127.0.0.1/events?clientId=${clientId}`), response as unknown as ServerResponse, activeThreadId);
+diff --git a/canvas-agent/src/canvas/session.ts b/canvas-agent/src/canvas/session.ts
+index e1376a2..1d8e218 100644
+--- a/canvas-agent/src/canvas/session.ts
++++ b/canvas-agent/src/canvas/session.ts
+@@ -8,12 +8,13 @@ import type { ToolName } from "./schemas.js";
+ import { compactCanvasState, compactNode, isToolName, nextCanvasX, parseToolInput } from "./tools.js";
+ import type { CanvasSnapshot } from "./types.js";
+ 
+-type PendingRequest = { clientId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
++type PendingRequest = { clientId: string; projectId?: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+ type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
+ type ReplayEvent = { type: string; payload: Record<string, unknown> };
+ export type CodexState = { busy: boolean; threadId: string; turnId: string };
+ export type McpStartupState = "starting" | "ready" | "failed" | "cancelled";
+ export type ConversationState = {
++    canvasId?: string;
+     revision: number;
+     conversationId: string;
+     threadId: string;
+@@ -51,14 +52,16 @@ export class CanvasSession {
+     private codexMutationBusy = false;
+     private activeClientId = "";
+     private boundClientId = "";
++    private boundCanvasId = "";
+     private focusSequence = 0;
+     private codexState: CodexState = { busy: false, threadId: "", turnId: "" };
+     private conversationState: ConversationState;
+     private conversationInventoryComplete = false;
+     private preparedConversationThreadId = "";
+ 
+-    constructor(activeThreadId = "") {
++    constructor(activeThreadId = "", canvasId = "") {
+         this.conversationState = {
++            canvasId,
+             revision: 1,
+             conversationId: activeThreadId || crypto.randomUUID(),
+             threadId: activeThreadId,
+@@ -69,7 +72,8 @@ export class CanvasSession {
+ 
+     /** 获取当前目标网页的画布状态。 */
+     private get canvasState() {
+-        return this.clients.has(this.targetClientId) ? this.canvasStates.get(this.targetClientId) || null : null;
++        const state = this.clients.has(this.targetClientId) ? this.canvasStates.get(this.targetClientId) || null : null;
++        return this.boundCanvasId && state?.projectId !== this.boundCanvasId ? null : state;
+     }
+ 
+     /** 获取当前 turn 绑定或最近激活的网页客户端。 */
+@@ -102,10 +106,11 @@ export class CanvasSession {
+     }
+ 
+     /** 原子开始一次新建或恢复对话流程。 */
+-    beginConversation(options: { threadId?: string; conversationId?: string; sourceClientId?: string } = {}) {
++    beginConversation(options: { threadId?: string; conversationId?: string; sourceClientId?: string; canvasId?: string } = {}) {
+         this.conversationInventoryComplete = false;
+         this.preparedConversationThreadId = "";
+         return this.updateConversation({
++            canvasId: options.canvasId ?? this.conversationState.canvasId ?? "",
+             conversationId: options.conversationId || options.threadId || crypto.randomUUID(),
+             threadId: options.threadId || "",
+             status: "preparing",
+@@ -326,12 +331,16 @@ export class CanvasSession {
+     bindClient(clientId: string) {
+         if (!this.clients.has(clientId)) throw new Error("当前网页未连接");
+         this.boundClientId = clientId;
++        this.boundCanvasId = this.canvasStates.get(clientId)?.projectId || "";
+         logger.debug("Canvas client bound to turn", { clientId });
+     }
+ 
+     /** 解除当前 Agent turn 的网页绑定。 */
+     releaseClient(clientId: string) {
+-        if (this.boundClientId === clientId) this.boundClientId = "";
++        if (this.boundClientId === clientId) {
++            this.boundClientId = "";
++            this.boundCanvasId = "";
++        }
+         logger.debug("Canvas client released from turn", { clientId });
+     }
+ 
+@@ -376,6 +385,10 @@ export class CanvasSession {
+         const item = body.requestId ? this.pending.get(body.requestId) : null;
+         if (!item || !body.requestId || item.clientId !== clientId) return false;
+         this.pending.delete(body.requestId);
++        if (item.projectId && this.canvasStates.get(clientId)?.projectId !== item.projectId) {
++            item.reject(new Error("画布已切换，已拒绝其他画布的工具结果"));
++            return false;
++        }
+         logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result });
+         body.error ? item.reject(new Error(body.error)) : item.resolve(body.result);
+         return true;
+@@ -491,7 +504,9 @@ export class CanvasSession {
+         const clientId = this.targetClientId;
+         const client = this.clients.get(clientId);
+         if (!client) throw new Error("当前没有已连接画布");
+-        sendEvent(client, "tool_call", { requestId, name, input });
++        if (this.boundCanvasId && this.canvasStates.get(clientId)?.projectId !== this.boundCanvasId) throw new Error("任务所属画布已切换，请回到原画布后继续");
++        const projectId = this.boundCanvasId || this.canvasStates.get(clientId)?.projectId;
++        sendEvent(client, "tool_call", { requestId, name, input, projectId });
+         logger.debug("Canvas tool request sent", { requestId, name, input, clientId });
+         return await new Promise((resolve, reject) => {
+             const timer = setTimeout(() => {
+@@ -499,7 +514,7 @@ export class CanvasSession {
+                 logger.warn("Canvas tool request timed out", { requestId, name, clientId });
+                 reject(new Error("画布操作超时"));
+             }, 30000);
+-            this.pending.set(requestId, { clientId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
++            this.pending.set(requestId, { clientId, projectId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+         });
+     }
+ }
+diff --git a/canvas-agent/src/config.test.ts b/canvas-agent/src/config.test.ts
+index fab5caf..4359379 100644
+--- a/canvas-agent/src/config.test.ts
++++ b/canvas-agent/src/config.test.ts
+@@ -4,10 +4,85 @@ import os from "node:os";
+ import path from "node:path";
+ import test from "node:test";
+ 
+-import { writeConfigFile, type CanvasAgentConfig } from "./config.js";
++import { archiveCanvasThread, bindCanvasThread, selectCanvasWorkspace, writeConfigFile, type CanvasAgentConfig, type SiteWorkspaceConfig } from "./config.js";
+ 
+ const sample: CanvasAgentConfig = { url: "http://127.0.0.1:17371", token: "test-token" };
+ 
++test("画布选择只恢复本画布绑定，不自动认领旧共享线程", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeThreadId: "legacy", pinnedThreadIds: ["legacy"], canvasThreads: { a: { activeThreadId: "thread-a", threadIds: ["thread-a"] } } };
++    const original = structuredClone(current);
++    const selected = selectCanvasWorkspace(current, "a");
++    assert.equal(selected.activeThreadId, "thread-a");
++    assert.equal(selected.activeCanvasId, "a");
++    assert.deepEqual(selectCanvasWorkspace(current, "b"), { ...current, siteThreadId: "legacy", activeCanvasId: "b", activeThreadId: undefined });
++    assert.deepEqual(selectCanvasWorkspace(selected, ""), { ...current, siteThreadId: "legacy", activeCanvasId: undefined });
++    assert.deepEqual(current, original);
++});
++
++test("画布绑定线程置顶去重，保留其他画布和原对象", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeCanvasId: "a", activeThreadId: "a-2", canvasThreads: { a: { activeThreadId: "a-2", threadIds: ["a-2", "a-1"] }, b: { activeThreadId: "b-1", threadIds: ["b-1"] } } };
++    const original = structuredClone(current);
++    const next = bindCanvasThread(current, "a-1");
++    assert.equal(next.activeThreadId, "a-1");
++    assert.deepEqual(next.canvasThreads?.a, { activeThreadId: "a-1", threadIds: ["a-1", "a-2"] });
++    assert.deepEqual(next.canvasThreads?.b, current.canvasThreads?.b);
++    assert.deepEqual(bindCanvasThread(next, "a-3").canvasThreads?.a.threadIds, ["a-3", "a-1", "a-2"]);
++    assert.deepEqual(current, original);
++});
++
++test("清空画布当前线程后重选不误恢复旧历史", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeCanvasId: "a", activeThreadId: "a-1", canvasThreads: { a: { activeThreadId: "a-1", threadIds: ["a-1"] } } };
++    const cleared = bindCanvasThread(current, "");
++    assert.equal(cleared.activeThreadId, undefined);
++    assert.deepEqual(cleared.canvasThreads?.a, { activeThreadId: undefined, threadIds: ["a-1"] });
++    assert.equal(selectCanvasWorkspace(cleared, "a").activeThreadId, undefined);
++    const standalone = bindCanvasThread({ workspacePath: "synthetic-workspace" }, "site-thread");
++    assert.deepEqual(standalone, { workspacePath: "synthetic-workspace", activeThreadId: "site-thread", siteThreadId: "site-thread" });
++});
++
++test("归档线程移除所有画布关联并清空被归档的当前线程", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeCanvasId: "a", activeThreadId: "shared", canvasThreads: { a: { activeThreadId: "shared", threadIds: ["shared", "a-old"] }, b: { activeThreadId: "b-1", threadIds: ["b-1", "shared"] }, c: { activeThreadId: "shared", threadIds: ["shared"] } } };
++    const original = structuredClone(current);
++    const next = archiveCanvasThread(current, "shared");
++    assert.equal(next.activeThreadId, undefined);
++    assert.deepEqual(next.canvasThreads, { a: { activeThreadId: undefined, threadIds: ["a-old"] }, b: { activeThreadId: "b-1", threadIds: ["b-1"] }, c: { activeThreadId: undefined, threadIds: [] } });
++    assert.deepEqual(archiveCanvasThread(current, "absent"), current);
++    assert.deepEqual(archiveCanvasThread({ workspacePath: "synthetic-workspace", activeThreadId: "site" }, "other"), { workspacePath: "synthetic-workspace", activeThreadId: "site" });
++    assert.deepEqual(current, original);
++});
++
++test("站点进入多个画布再退出时恢复原站点对话", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeThreadId: "legacy" };
++    const a = bindCanvasThread(selectCanvasWorkspace(current, "a"), "a-1");
++    const b = bindCanvasThread(selectCanvasWorkspace(a, "b"), "b-1");
++    assert.equal(b.siteThreadId, "legacy");
++    assert.equal(selectCanvasWorkspace(b, "a").activeThreadId, "a-1");
++    const site = selectCanvasWorkspace(b, "");
++    assert.equal(site.activeThreadId, "legacy");
++    assert.equal(site.activeCanvasId, undefined);
++    const replaced = bindCanvasThread(site, "site-new");
++    assert.equal(replaced.siteThreadId, "site-new");
++    assert.equal(selectCanvasWorkspace(selectCanvasWorkspace(replaced, "a"), "").activeThreadId, "site-new");
++    const archived = archiveCanvasThread(b, "legacy");
++    assert.equal(archived.siteThreadId, undefined);
++    assert.equal(archived.activeThreadId, "b-1");
++    assert.equal(selectCanvasWorkspace(archived, "").activeThreadId, undefined);
++    assert.equal(bindCanvasThread(site, "").siteThreadId, undefined);
++    assert.equal(current.activeThreadId, "legacy");
++});
++
++test("画布切换保留站点空对话标记，替换或归档时清理", () => {
++    const current: SiteWorkspaceConfig = { workspacePath: "synthetic-workspace", activeThreadId: "draft", siteThreadId: "draft", siteDraftThreadId: "draft" };
++    const a = bindCanvasThread(selectCanvasWorkspace(current, "a"), "a-1");
++    assert.equal(a.siteDraftThreadId, "draft");
++    const site = selectCanvasWorkspace(a, "");
++    assert.equal(site.activeThreadId, "draft");
++    assert.equal(bindCanvasThread(site, "draft").siteDraftThreadId, "draft");
++    assert.equal(bindCanvasThread(site, "new").siteDraftThreadId, undefined);
++    assert.equal(bindCanvasThread(site, "").siteDraftThreadId, undefined);
++    assert.equal(archiveCanvasThread(a, "draft").siteDraftThreadId, undefined);
++});
++
+ function makeTempBase(): string {
+     return fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-config-test-"));
+ }
+diff --git a/canvas-agent/src/config.ts b/canvas-agent/src/config.ts
+index 50f5049..69554a9 100644
+--- a/canvas-agent/src/config.ts
++++ b/canvas-agent/src/config.ts
+@@ -10,7 +10,8 @@ export const VERSION = readPackageVersion();
+ export const AGENT_PROMPT = fs.readFileSync(new URL("../agent-instructions.md", import.meta.url), "utf8");
+ const initializedWorkspaces = new Set<string>();
+ 
+-export type SiteWorkspaceConfig = { workspacePath: string; activeThreadId?: string; pinnedThreadIds?: string[] };
++export type CanvasThreadBinding = { activeThreadId?: string; threadIds: string[]; draftThreadId?: string };
++export type SiteWorkspaceConfig = { workspacePath: string; activeThreadId?: string; siteThreadId?: string; siteDraftThreadId?: string; pinnedThreadIds?: string[]; activeCanvasId?: string; canvasThreads?: Record<string, CanvasThreadBinding> };
+ export type CanvasAgentConfig = { url: string; token: string; origins?: string[]; workspace?: SiteWorkspaceConfig };
+ 
+ /** 读取本地 Canvas Agent 配置，不存在时生成默认配置。 */
+@@ -57,12 +58,43 @@ export function updateSiteWorkspace(config: CanvasAgentConfig, patch: Partial<Si
+     const current = ensureSiteWorkspace(config);
+     const workspacePath = patch.workspacePath ? resolveWorkspacePath(patch.workspacePath) : current.workspacePath;
+     const next = { ...current, ...patch, workspacePath };
+-    config.workspace = { workspacePath: next.workspacePath, activeThreadId: next.activeThreadId, pinnedThreadIds: next.pinnedThreadIds };
++    config.workspace = next;
+     initializeWorkspace(workspacePath);
+     saveConfig(config);
+     return config.workspace;
+ }
+ 
++/** 选择画布自己的对话，不自动认领旧站点线程。 */
++export function selectCanvasWorkspace(current: SiteWorkspaceConfig, canvasId: string): SiteWorkspaceConfig {
++    const siteThreadId = current.activeCanvasId ? current.siteThreadId : current.activeThreadId;
++    return { ...current, siteThreadId, activeCanvasId: canvasId || undefined, activeThreadId: canvasId ? current.canvasThreads?.[canvasId]?.activeThreadId : siteThreadId };
++}
++
++/** 更新当前画布的线程并保留旧对话；清空当前线程不会删除历史。 */
++export function bindCanvasThread(current: SiteWorkspaceConfig, threadId: string): SiteWorkspaceConfig {
++    const next = { ...current, activeThreadId: threadId || undefined };
++    if (!current.activeCanvasId) return { ...next, siteThreadId: threadId || undefined, ...(current.siteDraftThreadId && current.siteDraftThreadId !== threadId ? { siteDraftThreadId: undefined } : {}) };
++    const history = current.canvasThreads?.[current.activeCanvasId]?.threadIds || [];
++    const draftThreadId = current.canvasThreads?.[current.activeCanvasId]?.draftThreadId;
++    return { ...next, canvasThreads: { ...current.canvasThreads, [current.activeCanvasId]: { activeThreadId: threadId || undefined, threadIds: threadId ? [threadId, ...history.filter((id) => id !== threadId)] : [...history], ...(threadId && draftThreadId === threadId ? { draftThreadId } : {}) } } };
++}
++
++/** 删除线程的全部画布关联，不自动选中另一条历史。 */
++export function archiveCanvasThread(current: SiteWorkspaceConfig, threadId: string): SiteWorkspaceConfig {
++    return {
++        ...current,
++        activeThreadId: current.activeThreadId === threadId ? undefined : current.activeThreadId,
++        ...(current.siteThreadId === threadId ? { siteThreadId: undefined } : {}),
++        ...(current.siteDraftThreadId === threadId ? { siteDraftThreadId: undefined } : {}),
++        ...(current.canvasThreads ? { canvasThreads: Object.fromEntries(Object.entries(current.canvasThreads).map(([canvasId, binding]) => [canvasId, {
++            ...binding,
++            ...(binding.draftThreadId === threadId ? { draftThreadId: undefined } : {}),
++            activeThreadId: binding.activeThreadId === threadId ? undefined : binding.activeThreadId,
++            threadIds: binding.threadIds.filter((id) => id !== threadId),
++        }])) } : {}),
++    };
++}
++
+ /** 创建工作空间目录并写入默认 AGENTS.md。 */
+ function initializeWorkspace(workspacePath: string) {
+     if (initializedWorkspaces.has(workspacePath)) return;
+diff --git a/canvas-agent/src/server/http.ts b/canvas-agent/src/server/http.ts
+index 8b98c10..1f5b266 100644
+--- a/canvas-agent/src/server/http.ts
++++ b/canvas-agent/src/server/http.ts
+@@ -9,7 +9,7 @@ import type { CodexReasoningEffort, CodexSkillSelector } from "../agent/codex-pr
+ import { messageMetadataStore } from "../agent/message-metadata.js";
+ import type { AgentAttachment, AgentPermissionMode } from "../agent/types.js";
+ import { AGENT_PROTOCOL_VERSION, CanvasSession } from "../canvas/session.js";
+-import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
++import { archiveCanvasThread, bindCanvasThread, DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, selectCanvasWorkspace, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
+ import { logger } from "../utils/logger.js";
+ import { checkVersions } from "../version-check.js";
+ import { SkillStore, SkillStoreError } from "../skills/store.js";
+@@ -22,7 +22,7 @@ export function startHttpServer() {
+     saveConfig(config);
+ 
+     const initialWorkspace = ensureSiteWorkspace(config);
+-    const session = new CanvasSession(initialWorkspace.activeThreadId || "");
++    const session = new CanvasSession(initialWorkspace.activeThreadId || "", initialWorkspace.activeCanvasId || "");
+     const skillStore = new SkillStore(initialWorkspace.workspacePath);
+     /** 将 Agent 事件广播到所属线程或全部网页。 */
+     const emit = (type: string, payload: unknown) => {
+@@ -50,7 +50,15 @@ export function startHttpServer() {
+     };
+     /** 保存并广播当前站点工作空间的活跃线程。 */
+     const setActiveThread = (activeThreadId: string, payload: Record<string, unknown> = {}, preserveConversation = false) => {
+-        const workspace = updateSiteWorkspace(config, { activeThreadId: activeThreadId || undefined });
++        let current = ensureSiteWorkspace(config);
++        const emptyThreadId = current.activeCanvasId ? current.canvasThreads?.[current.activeCanvasId]?.draftThreadId : current.siteDraftThreadId;
++        if (payload.emptyThread && emptyThreadId) current = archiveCanvasThread(current, emptyThreadId);
++        let next = bindCanvasThread(current, activeThreadId);
++        if (next.activeCanvasId && next.canvasThreads && payload.draftThread) {
++            next = { ...next, canvasThreads: { ...next.canvasThreads, [next.activeCanvasId]: { ...next.canvasThreads[next.activeCanvasId], draftThreadId: activeThreadId || undefined } } };
++        }
++        if (!next.activeCanvasId && payload.draftThread) next = { ...next, siteDraftThreadId: activeThreadId || undefined };
++        const workspace = updateSiteWorkspace(config, next);
+         if (!preserveConversation) session.activateConversation(activeThreadId, String(payload.sourceClientId || "") || undefined);
+         if (!session.codexBusy && session.codexThreadId !== activeThreadId) session.setCodexState({ threadId: activeThreadId, turnId: "" });
+         session.emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId, conversation: session.conversationStateSnapshot });
+@@ -90,7 +98,7 @@ export function startHttpServer() {
+     /** 恢复已有线程并等待完整 MCP 清单，供启动恢复和手动切换共用。 */
+     const prepareExistingThread = async (threadId: string, clientId = "", permission: AgentPermissionMode = "request") => {
+         const workspace = ensureSiteWorkspace(config);
+-        session.beginConversation({ conversationId: threadId, threadId, sourceClientId: clientId || undefined });
++        session.beginConversation({ conversationId: threadId, threadId, sourceClientId: clientId || undefined, canvasId: workspace.activeCanvasId || "" });
+         emit("agent_bootstrap", { type: "codex.preparing", threadId, sourceClientId: clientId || undefined });
+         const result = await resumeCodexThread(emit, threadId, workspace.workspacePath, permission, true);
+         session.completeConversationPreparation(threadId);
+@@ -242,8 +250,57 @@ export function startHttpServer() {
+     }));
+     app.get("/agent/codex/threads", route(async (req, res) => {
+         const workspace = ensureSiteWorkspace(config);
+-        const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || "") });
+-        res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot, ...result });
++        const canvasId = String(req.headers["x-canvas-project"] || "");
++        const binding = workspace.canvasThreads?.[canvasId];
++        const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || ""), ...(canvasId ? { threadIds: binding?.threadIds || [] } : {}) });
++        res.json({ ok: true, workspace: canvasId ? { ...workspace, activeCanvasId: canvasId, activeThreadId: binding?.activeThreadId } : workspace, conversation: session.conversationStateSnapshot, ...result, data: canvasId ? result.data.filter((thread) => binding?.threadIds.includes(thread.id)) : result.data });
++    }));
++    app.post("/agent/codex/canvas/activate", route(async (req, res) => {
++        const canvasId = String(req.body?.canvasId || "");
++        const clientId = String(req.body?.clientId || "");
++        if (!session.hasClient(clientId) || (canvasId && session.canvasStateForClient(clientId)?.projectId !== canvasId)) return res.status(409).json({ ok: false, error: "画布快照尚未同步，请回到画布后重试" });
++        if (!session.beginCodexMutation()) return res.status(409).json({ ok: false, code: "CONVERSATION_BUSY", error: "Codex 正在运行或切换对话，请等待结束后切换画布" });
++        try {
++            const current = ensureSiteWorkspace(config);
++            const selected = selectCanvasWorkspace(current, canvasId);
++            if ((current.activeCanvasId || "") === canvasId && current.activeThreadId && ["ready", "warning"].includes(session.conversationStateSnapshot.status)) {
++                return res.json({ ok: true, workspace: current, conversation: session.conversationStateSnapshot });
++            }
++            updateSiteWorkspace(config, selected);
++            const threadId = selected.activeThreadId || "";
++            if (threadId) {
++                try {
++                    await prepareExistingThread(threadId, clientId, permissionMode(req.body?.permissionMode));
++                    setActiveThread(threadId, { sourceClientId: clientId }, true);
++                } catch (error) {
++                    const draftThreadId = canvasId ? selected.canvasThreads?.[canvasId]?.draftThreadId : selected.siteDraftThreadId;
++                    if (draftThreadId === threadId && isRecoverableThreadError(error)) {
++                        updateSiteWorkspace(config, archiveCanvasThread(ensureSiteWorkspace(config), threadId));
++                        session.beginConversation({ canvasId, sourceClientId: clientId });
++                        try {
++                            await prepareDraftThread(clientId, permissionMode(req.body?.permissionMode));
++                        } catch (draftError) {
++                            failPreparedConversation(draftError, "", clientId);
++                            throw draftError;
++                        }
++                        return res.json({ ok: true, workspace: ensureSiteWorkspace(config), conversation: session.conversationStateSnapshot });
++                    }
++                    failPreparedConversation(error, threadId, clientId);
++                    throw error;
++                }
++            } else {
++                session.beginConversation({ canvasId, sourceClientId: clientId });
++                try {
++                    await prepareDraftThread(clientId, permissionMode(req.body?.permissionMode));
++                } catch (error) {
++                    failPreparedConversation(error, "", clientId);
++                    throw error;
++                }
++            }
++            res.json({ ok: true, workspace: ensureSiteWorkspace(config), conversation: session.conversationStateSnapshot });
++        } finally {
++            session.endCodexMutation();
++        }
+     }));
+     app.post("/agent/codex/threads/new", codexMutation(async (req, res) => {
+         const clientId = String(req.body?.clientId || "");
+@@ -262,6 +319,8 @@ export function startHttpServer() {
+     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
+         const workspace = ensureSiteWorkspace(config);
+         const threadId = routeParam(req.params.threadId);
++        const canvasId = String(req.headers["x-canvas-project"] || "");
++        if (canvasId && !workspace.canvasThreads?.[canvasId]?.threadIds.includes(threadId)) return res.status(409).json({ ok: false, error: "这条对话不属于当前画布" });
+         res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot, ...(await readCodexThread(emit, threadId, workspace.workspacePath)) });
+     }));
+     app.post("/agent/codex/history/ack", (req, res) => {
+@@ -273,6 +332,8 @@ export function startHttpServer() {
+     app.post("/agent/codex/threads/:threadId/resume", codexMutation(async (req, res) => {
+         const threadId = routeParam(req.params.threadId);
+         const clientId = String(req.body?.clientId || "");
++        const workspace = ensureSiteWorkspace(config);
++        if (workspace.activeCanvasId && !workspace.canvasThreads?.[workspace.activeCanvasId]?.threadIds.includes(threadId)) return res.status(409).json({ ok: false, error: "这条对话不属于当前画布" });
+         try {
+             const result = await prepareExistingThread(threadId, clientId, permissionMode(req.body?.permissionMode));
+             const nextWorkspace = setActiveThread(threadId, { sourceClientId: clientId }, true);
+@@ -285,7 +346,9 @@ export function startHttpServer() {
+     app.post("/agent/codex/threads/:threadId/delete", codexMutation(async (req, res) => {
+         const workspace = ensureSiteWorkspace(config);
+         const threadId = routeParam(req.params.threadId);
++        if (workspace.activeCanvasId && !workspace.canvasThreads?.[workspace.activeCanvasId]?.threadIds.includes(threadId)) return res.status(409).json({ ok: false, error: "这条对话不属于当前画布" });
+         await archiveCodexThread(emit, threadId, workspace.workspacePath);
++        updateSiteWorkspace(config, archiveCanvasThread(workspace, threadId));
+         const nextWorkspace = setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "", { sourceClientId: String(req.body?.clientId || "") });
+         res.json({ ok: true, workspace: nextWorkspace, conversation: session.conversationStateSnapshot });
+     }));
+@@ -296,6 +359,7 @@ export function startHttpServer() {
+         if (!prompt.trim()) return res.status(400).json({ ok: false, error: "请输入任务内容" });
+         const clientId = String(req.body?.clientId || "");
+         if (!clientId || !session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起任务的网页已断开，请重新连接后再试" });
++        if (workspace.activeCanvasId && session.canvasStateForClient(clientId)?.projectId !== workspace.activeCanvasId) return res.status(409).json({ ok: false, error: "画布已切换，请等待对应对话恢复后再发送" });
+         const requestedThreadId = String(req.body?.threadId || "");
+         const activeThreadId = workspace.activeThreadId || "";
+         const conversation = session.conversationStateSnapshot;
+@@ -316,6 +380,10 @@ export function startHttpServer() {
+         let threadId = activeThreadId;
+         logger.info("Codex turn accepted", { threadId: req.body?.threadId, model: model || "default", reasoningEffort: effort || "default", promptLength: prompt.length, attachmentCount: attachments.length });
+         session.bindClient(clientId);
++        if (workspace.activeCanvasId && workspace.canvasThreads?.[workspace.activeCanvasId]?.draftThreadId === threadId) {
++            updateSiteWorkspace(config, { canvasThreads: { ...workspace.canvasThreads, [workspace.activeCanvasId]: { ...workspace.canvasThreads[workspace.activeCanvasId], draftThreadId: undefined } } });
++        }
++        if (!workspace.activeCanvasId && workspace.siteDraftThreadId === threadId) updateSiteWorkspace(config, { siteDraftThreadId: undefined });
+         session.markConversationRunning(threadId);
+         session.setCodexState({ busy: true, threadId, turnId: "" });
+         try {
+@@ -402,6 +470,8 @@ export function startHttpServer() {
+     /** 将 Codex 写操作串行化，避免多窗口在异步请求期间交叉修改会话。 */
+     function codexMutation(handler: (req: Request, res: Response) => unknown | Promise<unknown>) {
+         return route(async (req, res) => {
++            const canvasId = String(req.headers["x-canvas-project"] || "");
++            if (canvasId !== (ensureSiteWorkspace(config).activeCanvasId || "")) return res.status(409).json({ ok: false, code: "CANVAS_STALE", error: "当前画布对话尚未激活，请回到画布后重试" });
+             if (!session.beginCodexMutation()) return res.status(409).json({ ok: false, code: "CONVERSATION_BUSY", error: "Codex 正在运行或正在切换会话，请稍后重试", state: session.conversationStateSnapshot });
+             try {
+                 return await handler(req, res);
+@@ -444,7 +514,10 @@ export function startHttpServer() {
+         const activeThreadId = initialWorkspace.activeThreadId || "";
+         if (activeThreadId && session.beginCodexMutation()) {
+             void prepareExistingThread(activeThreadId).catch(async (error) => {
+-                if (!isRecoverableThreadError(error)) return failPreparedConversation(error, activeThreadId);
++                const canvasId = initialWorkspace.activeCanvasId;
++                const knownEmpty = (canvasId ? initialWorkspace.canvasThreads?.[canvasId]?.draftThreadId : initialWorkspace.siteDraftThreadId) === activeThreadId;
++                if (!isRecoverableThreadError(error) || !knownEmpty) return failPreparedConversation(error, activeThreadId);
++                if (knownEmpty) updateSiteWorkspace(config, archiveCanvasThread(ensureSiteWorkspace(config), activeThreadId));
+                 session.beginConversation();
+                 setActiveThread("", { emptyThread: true, draftThread: true }, true);
+                 await prepareDraftThread("", "request");
+@@ -521,7 +594,7 @@ function requestUrl(req: Request, config: CanvasAgentConfig) {
+ function setCors(req: Request, res: Response, url: URL, config: CanvasAgentConfig) {
+     const origin = req.headers.origin;
+     res.setHeader("Access-Control-Allow-Origin", origin || "*");
+-    res.setHeader("Access-Control-Allow-Headers", "content-type,x-canvas-agent-token");
++    res.setHeader("Access-Control-Allow-Headers", "content-type,x-canvas-agent-token,x-canvas-project");
+     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+     res.setHeader("Access-Control-Allow-Private-Network", "true");
+     if (!origin || req.method === "OPTIONS" || url.pathname === "/health" || url.pathname === "/config") return true;
+diff --git a/docs/content/docs/progress/pending-test.mdx b/docs/content/docs/progress/pending-test.mdx
+index e54642c..39ef7b6 100644
+--- a/docs/content/docs/progress/pending-test.mdx
++++ b/docs/content/docs/progress/pending-test.mdx
+@@ -7,6 +7,11 @@ description: Implemented changes that still need manual verification
+ 
+ The current release needs manual verification in these areas:
+ 
++- 插件认证兼容：本机 Windows Agent 优先使用 PATH 中的桌面端 Codex CLI；CANVAS_CODEX_PATH 可指定现有执行文件，找不到桌面 CLI 时回退项目依赖。旧版 CLI 缺少插件使用的 OAuth client_secret 选项。Canva 的 invalid_client 需用户重新授权；GitHub 能否采用插件 OAuth 配置仍待用户确认。此次只部署启动代码，未启动新版子进程、登录、连接、调用模型或运行测试，没有清除或复制认证凭据。
++- 画布独立对话：切换画布应恢复各自的聊天和历史；“新对话”只影响当前画布，离开画布后恢复站点对话。旧共享聊天已按用户选择归给“无限画布 3”，未删除旧消息。已在本机确认画布 3 恢复旧回答，画布 1 使用独立空对话；合成检查覆盖新建、恢复、历史归属、任务互斥、已发送历史失败保留和未发送空对话重建，以及附件下载期间切换画布时拒绝跨画布写入。多窗口长任务、实际发消息后的来回恢复、浏览器重开仍待用户确认；没有发送模型或生图请求。
++- Codex 分页历史：旧对话应恢复用户消息、助手回答、附件及顺序，不再报 `paginated threads do not support thread/read(includeTurns=true)`；刷新页面或重启 Agent 后应保持原线程，终态快照重新读取也应正常。已在本机原线程确认重启后 `ready`、40 条消息及聊天栏旧消息/附件显示，10 项源码/已安装运行文件离线检查通过；跨更多分页的实际长对话、后续终态快照刷新及收费模型调用未测试。
++- 本机 Switcher 适配：刷新本地开发网页后应新增“Switcher 生图”渠道；首次手动配置模型后，在 Switcher 应用其他图片站点，地址和密钥应自动更新，模型、脚本、其他渠道和偏好保持不变。读取失败应阻止旧连接发送请求；没有新增的远程图片服务测试结果，线上站点和静态部署不启用此适配。
++
+ - Saved model selection: save a canvas node with a model, then remove its provider or remove that model while another video model remains the default. Generation, retry and pending-video recovery should keep the unavailable model selected and open configuration instead of sending a request to the default or first provider. Re-selecting a valid model should allow generation. Changing only the API key on the same provider should preserve the model; switching a config node from a valid image model to video should still use the video default.
+ 
+ - Local storage usage on HTTP deployments: opening the Local storage settings tab at an HTTP origin without `navigator.storage.estimate` should still show IndexedDB content statistics, display an unavailable quota instead of an error, and keep the canvas data unchanged.
+diff --git a/web/src/components/agent/local-agent-panel.tsx b/web/src/components/agent/local-agent-panel.tsx
+index 0213290..c1e6ad8 100644
+--- a/web/src/components/agent/local-agent-panel.tsx
++++ b/web/src/components/agent/local-agent-panel.tsx
+@@ -127,7 +127,11 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+     const { t } = useTranslation();
+     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+     const { message, modal } = App.useApp();
+-    const { hash } = useLocation();
++    const { hash, pathname } = useLocation();
++    const canvasPath = pathname.split("/");
++    const canvasId = canvasPath[1] === "canvas" ? decodeURIComponent(canvasPath[2] || "") : "";
++    const activeCanvasRef = useRef(canvasId);
++    activeCanvasRef.current = canvasId;
+     const [searchParams] = useSearchParams();
+     const navigate = useNavigate();
+     // Field-level selectors with useShallow rerender only when these fields change.
+@@ -165,7 +169,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+         })),
+     );
+     const setAgentState = useAgentStore((state) => state.setAgentState);
+-    const conversationReady = conversation.status === "ready" || conversation.status === "warning";
++    const conversationReady = (conversation.status === "ready" || conversation.status === "warning") && (conversation.canvasId || "") === canvasId;
+     const conversationBusy = conversation.status === "preparing" || conversation.status === "running";
+     const closePanel = useAgentStore((state) => state.closePanel);
+     const pushMessage = useAgentStore((state) => state.addMessage);
+@@ -274,6 +278,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+         return loadThreadsSequenceRef.current;
+     }, [setAgentState]);
+     const applyConversationState = useCallback((next: AgentConversationState, force = false) => {
++        if ((next.canvasId || "") !== activeCanvasRef.current) return false;
+         const current = useAgentStore.getState();
+         if (!next?.revision || !force && next.revision <= current.conversation.revision) return false;
+         const conversationChanged = next.conversationId !== current.conversation.conversationId;
+@@ -301,6 +306,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             }
+             const current = useAgentStore.getState();
+             const currentThreadId = current.activeThreadId || data.workspace?.activeThreadId || "";
++            if ((current.conversation.canvasId || "") !== activeCanvasRef.current) return;
+             if (!data.conversation && currentThreadId !== current.activeThreadId) sequence = applyWorkspaceChange({ activeThreadId: currentThreadId });
+             if (sequence !== loadThreadsSequenceRef.current || useAgentStore.getState().activeThreadId !== currentThreadId) return;
+             setAgentState({ threads: data.data || [], workspacePath: data.workspace?.workspacePath || "" });
+@@ -316,6 +322,39 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             if (sequence === loadThreadsSequenceRef.current && !threadOperationRef.current) setAgentState({ loadingThreads: false });
+         }
+     }, [applyConversationState, applyWorkspaceChange, endpoint, loadThreadSnapshot, setAgentState, token]);
++    const syncingCanvasRef = useRef<string | null>(null);
++    const syncCanvasConversation = useCallback(async (): Promise<void> => {
++        const projectId = activeCanvasRef.current;
++        if (!useAgentStore.getState().connected || syncingCanvasRef.current !== null || document.visibilityState !== "visible" || !document.hasFocus()) return;
++        const snapshot = canvasContextRef.current?.snapshot;
++        if (projectId && snapshot?.projectId !== projectId) return;
++        syncingCanvasRef.current = projectId;
++        try {
++            if (!await postState(endpoint, token, clientIdRef.current, projectId ? snapshot || null : null)) throw new Error("画布快照同步失败，请重新连接后重试");
++            const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/canvas/activate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ canvasId: projectId, clientId: clientIdRef.current, permissionMode: useAgentStore.getState().permissionMode }) });
++            if (activeCanvasRef.current !== projectId) return;
++            if (result.conversation) applyConversationState(result.conversation, true);
++            await loadThreads();
++        } catch (error) {
++            if (activeCanvasRef.current === projectId) {
++                addEventLog("画布对话切换失败", error);
++                setAgentState({ activity: error instanceof Error ? error.message : "画布对话切换失败" });
++            }
++        } finally {
++            syncingCanvasRef.current = null;
++            if (activeCanvasRef.current !== projectId) void syncCanvasConversation();
++        }
++    }, [applyConversationState, endpoint, loadThreads, setAgentState, token]);
++    useEffect(() => {
++        loadThreadsSequenceRef.current += 1;
++        setAgentState({ messages: [], threads: [], activeThreadId: "", activeTurnId: "", prompt: "", attachments: [], canvasReferences: [], tokenUsage: null, pendingTool: null, pendingApprovals: [], waiting: false, sending: false });
++        if (connected) void syncCanvasConversation();
++    }, [canvasId, connected, setAgentState, syncCanvasConversation]);
++    useEffect(() => {
++        const activate = () => { if (document.hasFocus()) void syncCanvasConversation(); };
++        window.addEventListener("focus", activate);
++        return () => window.removeEventListener("focus", activate);
++    }, [syncCanvasConversation]);
+     // Imperatively subscribe to canvasContext to keep the ref current and debounce snapshot reports without rerendering the panel.
+     useEffect(() => {
+         let timer: ReturnType<typeof setTimeout> | null = null;
+@@ -323,6 +362,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             if (state.canvasContext === canvasContextRef.current) return;
+             canvasContextRef.current = state.canvasContext;
+             if (!useAgentStore.getState().connected) return;
++            if (state.canvasContext?.snapshot.projectId === activeCanvasRef.current && (useAgentStore.getState().conversation.canvasId || "") !== activeCanvasRef.current) void syncCanvasConversation();
+             if (timer) clearTimeout(timer);
+             timer = setTimeout(() => void postState(endpoint, token, clientIdRef.current, canvasContextRef.current?.snapshot || null), 300);
+         });
+@@ -330,7 +370,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             unsubscribe();
+             if (timer) clearTimeout(timer);
+         };
+-    }, [endpoint, token]);
++    }, [endpoint, token, syncCanvasConversation]);
+     useEffect(() => {
+         confirmToolsRef.current = confirmTools;
+     }, [confirmTools]);
+@@ -371,10 +411,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+                 return;
+             }
+             const codex = hello?.codex;
+-            const busy = Boolean(codex?.busy);
+-            const nextThreadId = hello?.conversation?.threadId ?? hello?.workspace?.activeThreadId ?? useAgentStore.getState().activeThreadId;
++            const matchesCanvas = (hello?.conversation?.canvasId || "") === activeCanvasRef.current;
++            const busy = matchesCanvas && Boolean(codex?.busy);
++            const nextThreadId = matchesCanvas ? hello?.conversation?.threadId ?? hello?.workspace?.activeThreadId ?? useAgentStore.getState().activeThreadId : "";
+             if (hello?.conversation) applyConversationState(hello.conversation, true);
+             else applyWorkspaceChange({ activeThreadId: nextThreadId });
++            if (!matchesCanvas) applyWorkspaceChange({ activeThreadId: "", emptyThread: true });
+             const current = useAgentStore.getState();
+             const nextTurnId = codex?.threadId === nextThreadId ? codex.turnId ?? "" : "";
+             if (nextTurnId) liveTurnKeysRef.current.add(`${nextThreadId}\0${nextTurnId}`);
+@@ -401,15 +443,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             if (!headless) message.success(rt("localAgentConnected"));
+             void postState(endpoint, token, clientId, canvasContextRef.current?.snapshot || null);
+             if (document.visibilityState === "visible" && document.hasFocus()) void activateAgentClient(endpoint, token, clientId);
+-            if (!busy && !nextThreadId && (!hello?.conversation || hello.conversation.status === "idle")) {
+-                void fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId, permissionMode }) })
+-                    .then((result) => result.conversation && applyConversationState(result.conversation))
+-                    .catch((error) => {
+-                        const state = agentErrorState(error);
+-                        if (state) applyConversationState(state);
+-                        addEventLog(rt("conversationInitFailed"), error);
+-                    });
+-            }
++            if (!matchesCanvas || !nextThreadId) void syncCanvasConversation();
+         });
+         source.addEventListener("codex_state", (event) => {
+             const data = parseEventData<AgentCodexState>(event);
+@@ -418,6 +452,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+                 const busy = Boolean(data.busy);
+                 const current = useAgentStore.getState();
+                 const appliesToCurrentThread = !data.threadId || data.threadId === current.activeThreadId;
++                if (!busy && document.hasFocus() && (current.conversation.canvasId || "") !== activeCanvasRef.current) void syncCanvasConversation();
+                 if (!appliesToCurrentThread) return;
+                 const turnId = data.turnId || current.activeTurnId;
+                 if (turnId) liveTurnKeysRef.current.add(`${current.activeThreadId}\0${turnId}`);
+@@ -493,12 +528,21 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+         });
+         source.addEventListener("conversation_changed", (event) => {
+             const data = parseEventData<AgentConversationState>(event);
+-            if (data) enqueueEvent(() => { applyConversationState(data); });
++            if (data) enqueueEvent(() => {
++                if ((data.canvasId || "") !== activeCanvasRef.current) {
++                    setAgentState({ conversation: data, messages: [], threads: [], activeThreadId: "", activeTurnId: "", pendingTool: null, pendingApprovals: [], waiting: false, sending: false });
++                    if (["ready", "warning"].includes(data.status)) void syncCanvasConversation();
++                    return;
++                }
++                applyConversationState(data);
++                if (["ready", "warning"].includes(data.status)) void syncCanvasConversation();
++            });
+         });
+         source.addEventListener("workspace_changed", (event) => {
+             const data = parseEventData<AgentWorkspaceEvent>(event);
+             if (!data) return;
+             enqueueEvent(() => {
++                if ((data.conversation?.canvasId || "") !== activeCanvasRef.current) return;
+                 if (data.conversation) applyConversationState(data.conversation);
+                 else applyWorkspaceChange(data);
+                 if (!data.draftThread) void loadThreads(Boolean(data.emptyThread));
+@@ -578,7 +622,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+             loadThreadsSequenceRef.current += 1;
+             useAgentSkillStore.getState().reset();
+         };
+-    }, [applyConversationState, applyWorkspaceChange, clientReady, enabled, endpoint, loadSkills, loadThreads, message, setAgentState, token]);
++    }, [applyConversationState, applyWorkspaceChange, clientReady, enabled, endpoint, loadSkills, loadThreads, message, setAgentState, syncCanvasConversation, token]);
+ 
+     useEffect(() => {
+         if (connected) void loadThreads();
+@@ -632,6 +676,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+         const selectedSkill = skillState.selectedSkill;
+         const selectedSkillRevision = skillState.selectionRevision;
+         const currentState = useAgentStore.getState();
++        if ((currentState.conversation.canvasId || "") !== activeCanvasRef.current) return;
+         const canvasNodeIds = new Set(currentState.canvasContext?.snapshot.nodes.map((node) => node.id) || []);
+         const canvasReferences = currentState.canvasReferences.filter((item) => canvasNodeIds.has(item.nodeId));
+         if (canvasReferences.length !== currentState.canvasReferences.length) {
+@@ -805,6 +850,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+     };
+ 
+     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
++        if (payload.projectId && payload.projectId !== canvasContextRef.current?.snapshot.projectId) {
++            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: "画布已切换，已拒绝跨画布执行工具" });
++            return;
++        }
+         if (isSiteTool(payload.name)) {
+             try {
+                 addEventLog(toolName(payload.name), payload, payload);
+@@ -832,9 +881,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
+                 result = context.applyOps(appliedOps);
+                 void postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
+             } else if (payload.name === "canvas_create_attachment_nodes") {
++                appliedOps = await attachmentNodeOps(endpoint, token, clientIdRef.current, payload.input?.nodes);
+                 const context = canvasContextRef.current;
+                 if (!context) throw new Error(rt("openCanvasFirst"));
+-                appliedOps = await attachmentNodeOps(endpoint, token, clientIdRef.current, payload.input?.nodes);
++                if (payload.projectId && (context.snapshot.projectId !== payload.projectId || activeCanvasRef.current !== payload.projectId)) throw new Error("画布已切换，已停止添加附件图片");
+                 result = context.applyOps(appliedOps);
+                 await postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
+             } else {
+diff --git a/web/src/components/layout/client-root-init.tsx b/web/src/components/layout/client-root-init.tsx
+index d8fe078..76af63e 100644
+--- a/web/src/components/layout/client-root-init.tsx
++++ b/web/src/components/layout/client-root-init.tsx
+@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
+ 
+ import { useConfigStore } from "@/stores/use-config-store";
+ import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
++import { syncSwitcherConnection } from "@/services/api/switcher";
+ 
+ export function ClientRootInit({ children }: { children: ReactNode }) {
+     const { message } = App.useApp();
+@@ -15,6 +16,20 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
+ 
+     usePromptSourceScheduler();
+ 
++    useEffect(() => {
++        if (!import.meta.env.DEV) return;
++        const sync = () => { void syncSwitcherConnection().catch(() => {}); };
++        sync();
++        window.addEventListener("focus", sync);
++        import.meta.hot?.on("relay-switcher:changed", sync);
++        import.meta.hot?.on("vite:ws:connect", sync);
++        return () => {
++            window.removeEventListener("focus", sync);
++            import.meta.hot?.off("relay-switcher:changed", sync);
++            import.meta.hot?.off("vite:ws:connect", sync);
++        };
++    }, []);
++
+     useEffect(() => {
+         if (handledConfigParams.current) return;
+         const searchParams = new URLSearchParams(window.location.search);
+diff --git a/web/src/services/api/canvas-agent.ts b/web/src/services/api/canvas-agent.ts
+index b70722e..8b34590 100644
+--- a/web/src/services/api/canvas-agent.ts
++++ b/web/src/services/api/canvas-agent.ts
+@@ -117,7 +117,11 @@ export function setCodexSkillEnabled(endpoint: string, token: string, skill: Pic
+ 
+ export async function fetchAgentJson<T>(endpoint: string, token: string, path: string, init?: RequestInit) {
+     const url = `${endpoint}${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+-    const res = await fetch(url, init);
++    const headers = new Headers(init?.headers);
++    const canvasPath = window.location.pathname.split("/");
++    const canvasId = canvasPath[1] === "canvas" ? canvasPath[2] : undefined;
++    if (canvasId) headers.set("x-canvas-project", decodeURIComponent(canvasId));
++    const res = await fetch(url, { ...init, headers });
+     const data = (await res.json().catch(() => ({}))) as T & { error?: string; msg?: string };
+     if (!res.ok) throw new AgentApiError(res.status, data);
+     return data;
+diff --git a/web/src/services/api/image.ts b/web/src/services/api/image.ts
+index 421666a..fd903c1 100644
+--- a/web/src/services/api/image.ts
++++ b/web/src/services/api/image.ts
+@@ -9,6 +9,7 @@ import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
+ import { imageToDataUrl } from "@/services/image-storage";
+ import { imageSizePresets, inferMediaScale } from "@/lib/media-size";
+ import type { ReferenceImage } from "@/types/image";
++import { refreshSwitcherChannel, refreshSwitcherImageConfig } from "./switcher";
+ 
+ const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
+ 
+@@ -692,6 +693,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
+ }
+ 
+ export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
++    config = await refreshSwitcherImageConfig(config);
+     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+     const script = resolveModelScript(config, config.model || config.imageModel);
+@@ -752,6 +754,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
+ }
+ 
+ export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
++    config = await refreshSwitcherImageConfig(config);
+     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+     const requestPrompt = buildImageReferencePromptText(prompt, references);
+@@ -881,6 +884,7 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
+ }
+ 
+ export async function fetchChannelModels(channel: ModelChannel) {
++    channel = await refreshSwitcherChannel(channel);
+     return fetchImageModels({ baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat });
+ }
+ 
+diff --git a/web/src/stores/use-agent-store.ts b/web/src/stores/use-agent-store.ts
+index 7390b51..1f21347 100644
+--- a/web/src/stores/use-agent-store.ts
++++ b/web/src/stores/use-agent-store.ts
+@@ -11,7 +11,7 @@ export type AgentCanvasReference = Pick<CanvasResourceReference, "nodeId" | "lab
+ export type AgentSkillReference = { name: string; path: string; displayName?: string };
+ export type AgentChatItem = { id: string; itemId?: string; clientMessageId?: string; threadId?: string; turnId?: string; role: AgentChatRole; title?: string; text: string; meta?: string; detail?: unknown; attachments?: AgentMessageAttachment[]; canvasReferences?: AgentCanvasReference[]; skill?: AgentSkillReference; streamId?: string; activityItems?: Record<string, string> };
+ export type AgentEventLog = { id: string; time: string; title: string; text: string; raw?: unknown };
+-export type AgentPendingToolCall = { requestId: string; name: string; input?: { ops?: CanvasAgentOp[]; path?: string } & Record<string, unknown> };
++export type AgentPendingToolCall = { requestId: string; name: string; projectId?: string; input?: { ops?: CanvasAgentOp[]; path?: string } & Record<string, unknown> };
+ export type AgentPermissionMode = "request" | "automatic" | "full";
+ export type AgentReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+ export type AgentModel = {
+@@ -29,6 +29,7 @@ export type AgentThreadSummary = { id: string; preview: string; name?: string |
+ export type AgentTokenUsage = { input: number; cached: number; output: number };
+ export type AgentBootstrapStatus = { key: string; text: string; detail: string; status: "running" | "ready" | "error" };
+ export type AgentConversationState = {
++    canvasId?: string;
+     revision: number;
+     conversationId: string;
+     threadId: string;
+diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
+index 6c989d7..f39d65f 100644
+--- a/web/src/stores/use-config-store.ts
++++ b/web/src/stores/use-config-store.ts
+@@ -72,6 +72,9 @@ export type ChannelCredentialsImportResult = {
+     channelName?: string;
+ };
+ 
++export const SWITCHER_IMAGE_CHANNEL_ID = "relay-switcher-image";
++export type SwitcherImageConnection = { name: string; baseUrl: string; apiKey: string };
++
+ export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
+ const CHANNEL_MODEL_SEPARATOR = "::";
+ const OPENAI_BASE_URL = "https://api.openai.com";
+@@ -143,6 +146,7 @@ type ConfigStore = {
+     shouldPromptContinue: boolean;
+     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
+     importChannelCredentials: (input: { baseUrl?: string | null; apiKey?: string | null }) => ChannelCredentialsImportResult;
++    syncSwitcherImageConnection: (input: SwitcherImageConnection | null) => void;
+     updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
+     isAiConfigReady: (config: AiConfig, model: string) => boolean;
+     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
+@@ -233,6 +237,20 @@ export const useConfigStore = create<ConfigStore>()(
+                 if (result.config !== currentConfig) set({ config: result.config });
+                 return { status: result.status, channelName: result.channelName };
+             },
++            syncSwitcherImageConnection: (input) => {
++                const { config } = get();
++                const existing = config.channels.find((channel) => channel.id === SWITCHER_IMAGE_CHANNEL_ID);
++                if (!input && !existing) return;
++                const connection = {
++                    name: input ? `Switcher 生图 · ${input.name}` : "Switcher 生图（尚未应用站点）",
++                    baseUrl: input?.baseUrl || "",
++                    apiKey: input?.apiKey || "",
++                };
++                if (existing && existing.name === connection.name && existing.baseUrl === connection.baseUrl && existing.apiKey === connection.apiKey) return;
++                const channel = existing ? { ...existing, ...connection } : createModelChannel({ id: SWITCHER_IMAGE_CHANNEL_ID, ...connection, models: [] });
++                const channels = existing ? config.channels.map((item) => item.id === channel.id ? channel : item) : [...config.channels, channel];
++                set({ config: { ...config, channels } });
++            },
+             updateWebdavConfig: (key, value) =>
+                 set((state) => ({
+                     webdav: {
+diff --git a/web/vite.config.ts b/web/vite.config.ts
+index 263c130..75e39ed 100644
+--- a/web/vite.config.ts
++++ b/web/vite.config.ts
+@@ -1,4 +1,6 @@
+-import { readdirSync, readFileSync } from "node:fs";
++import { existsSync, readdirSync, readFileSync } from "node:fs";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
+ import { dirname, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import react from "@vitejs/plugin-react";
+@@ -10,6 +12,59 @@ const webDir = dirname(fileURLToPath(import.meta.url));
+ const localVersion = readFileSync(resolve(webDir, "../VERSION"), "utf8").trim() || "dev";
+ const localChangelog = readFileSync(resolve(webDir, "../CHANGELOG.md"), "utf8");
+ 
++// Local-only handoff: credentials travel in a private pipe and a same-origin, uncached response.
++function relaySwitcherConnection(): Plugin {
++    const helper = resolve(process.env.RELAY_SWITCHER_ROOT || "D:/Switch api", "relay_canvas.py");
++    const run = promisify(execFile);
++    const read = async (mode: string) => {
++        const args = [helper, mode];
++        if (process.env.RELAY_SWITCHER_HOME) args.push("--home", process.env.RELAY_SWITCHER_HOME);
++        const result = await run(process.env.RELAY_SWITCHER_PYTHON || "python", args, { windowsHide: true });
++        return JSON.parse(result.stdout);
++    };
++    return {
++        name: "relay-switcher-connection",
++        apply: "serve",
++        async configureServer(server) {
++            server.middlewares.use("/__relay_switcher/image-connection", async (req, res) => {
++                res.setHeader("Cache-Control", "no-store");
++                res.setHeader("Content-Type", "application/json; charset=utf-8");
++                res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
++                const host = req.headers.host || "";
++                const origin = `http://${host}`;
++                const localHost = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
++                const localPeer = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress || "");
++                if (req.method !== "GET" || !localHost || !localPeer
++                    || req.headers["x-relay-switcher"] !== "canvas"
++                    || (req.headers.origin && req.headers.origin !== origin)
++                    || (req.headers["sec-fetch-site"] && req.headers["sec-fetch-site"] !== "same-origin")) {
++                    res.statusCode = 403;
++                    res.end('{"error":"Local Canvas requests only."}');
++                    return;
++                }
++                try {
++                    res.end(JSON.stringify(await read("--connection-json")));
++                } catch {
++                    res.statusCode = 503;
++                    res.end('{"error":"Switcher connection unavailable."}');
++                }
++            });
++            if (!existsSync(helper)) return;
++            try {
++                const source = resolve(await read("--source-path"));
++                server.watcher.add(source);
++                const changed = (_event: string, file: string) => {
++                    if (resolve(file) === source) server.ws.send({ type: "custom", event: "relay-switcher:changed", data: {} });
++                };
++                server.watcher.on("all", changed);
++                server.httpServer?.once("close", () => server.watcher.off("all", changed));
++            } catch {
++                // A missing source never prevents the rest of the canvas from opening.
++            }
++        },
++    };
++}
++
+ // Expose /plugins/index.json with local plugin files from public/plugins.
+ // The frontend can discover and list them when enabled; development reads the directory live, while builds emit a static registry.
+ function localPluginsManifest(): Plugin {
+@@ -40,7 +95,7 @@ function localPluginsManifest(): Plugin {
+ 
+ export default defineConfig({
+     base: process.env.VITE_BASE || "/",
+-    plugins: [react(), localPluginsManifest()],
++    plugins: [react(), localPluginsManifest(), relaySwitcherConnection()],
+     resolve: {
+         alias: {
+             "@": resolve(webDir, "src"),
+diff --git a/web/src/services/api/switcher.ts b/web/src/services/api/switcher.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/services/api/switcher.ts
+@@ -0,0 +1,36 @@
++import { decodeChannelModel, resolveModelChannel, SWITCHER_IMAGE_CHANNEL_ID, useConfigStore, type AiConfig, type ModelChannel, type SwitcherImageConnection } from "@/stores/use-config-store";
++
++let latestRequest = 0;
++
++export async function syncSwitcherConnection(): Promise<SwitcherImageConnection | null> {
++    const sequence = ++latestRequest;
++    try {
++        const response = await fetch("/__relay_switcher/image-connection", {
++            cache: "no-store",
++            headers: { "X-Relay-Switcher": "canvas" },
++        });
++        if (!response.ok) throw new Error();
++        const connection: SwitcherImageConnection | null = await response.json();
++        if (connection !== null && (!connection || typeof connection.name !== "string"
++            || typeof connection.baseUrl !== "string" || typeof connection.apiKey !== "string")) throw new Error();
++        if (sequence === latestRequest) useConfigStore.getState().syncSwitcherImageConnection(connection);
++        return connection;
++    } catch {
++        if (sequence === latestRequest) useConfigStore.getState().syncSwitcherImageConnection(null);
++        throw new Error("无法同步 Switcher 生图站点，本次请求未发送。请检查本地服务，并在 Switcher 中重新应用图片站点。");
++    }
++}
++
++export async function refreshSwitcherChannel(channel: ModelChannel): Promise<ModelChannel> {
++    if (!import.meta.env.DEV || channel.id !== SWITCHER_IMAGE_CHANNEL_ID) return channel;
++    const connection = await syncSwitcherConnection();
++    if (!connection) throw new Error("Switcher 尚未应用可用的图片站点，本次请求未发送。");
++    return { ...channel, baseUrl: connection.baseUrl, apiKey: connection.apiKey };
++}
++
++export async function refreshSwitcherImageConfig(config: AiConfig): Promise<AiConfig> {
++    const value = config.model || config.imageModel;
++    if (!import.meta.env.DEV || decodeChannelModel(value)?.channelId !== SWITCHER_IMAGE_CHANNEL_ID) return config;
++    const channel = await refreshSwitcherChannel(resolveModelChannel(config, value));
++    return { ...config, channels: config.channels.map((item) => item.id === SWITCHER_IMAGE_CHANNEL_ID ? channel : item) };
++}

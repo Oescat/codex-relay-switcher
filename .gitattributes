@@ -1,0 +1,2 @@
+# Keep unified-diff context lines intact; validate patches with git apply --check.
+integrations/*.patch text eol=lf -whitespace
