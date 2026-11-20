@@ -4,7 +4,7 @@
 
 ## 当前目标
 
-当前 Switcher 与 Infinite Canvas 交接说明已整理为无凭据的源码 ZIP，程序、说明和补丁已同步到 Oescat/codex-relay-switcher 的 main。交接文件为 INFINITE_CANVAS_ADAPTATION.md，标题“适配 Infinite Canvas 的说明”。Canvas 程序本体、用户画布、依赖和授权不随包分发。
+当前 Switcher 与 Infinite Canvas 交接说明已整理为无凭据的源码 ZIP，程序、说明和补丁已同步到 Oescat/codex-relay-switcher 的 main，ZIP 和校验文件已发布到 portable-2026-11-19 Release。交接文件为 INFINITE_CANVAS_ADAPTATION.md，标题“适配 Infinite Canvas 的说明”。Canvas 程序本体、用户画布、依赖和授权不随包分发。
 
 ## 已完成功能
 
@@ -37,11 +37,11 @@
 
 - 本地目标：codex-relay-switcher-for-new-pc.zip，完整 Switcher 源码和适配说明，不是包含 Python 或 Canvas 的一键安装器。
 - 上传前基线 main 为 7c768b28e3c7bd650828defb1b55eb42579f5494。程序及交接说明已通过 GitHub 插件上传为 ad760d250ff327d998cd736ef6188ffbcf01437e；已核对其 Git tree 与本地提交一致。普通 Git push 遇到连接重置，因此使用插件上传，没有强推或覆盖远端新增提交。本次日期与状态记录随后同步。
-- ZIP 下载附件发布目标为 GitHub Release portable-2026-11-19；文件上传和最终远端核验结果以本次交付回复为准，发布中断时不得只凭本说明认定附件已存在。
+- ZIP 已发布到 GitHub Release portable-2026-11-19，来源提交 b954ae7da87dc4e5073c6adeb8f783b257811c53，26 个条目，303370 字节。GitHub 资产状态、长度和 SHA-256 均与本地一致；校验文件一同上传。SHA-256：0f170fb249e6fa819f34a8e1d433c6aefa2eecb0fce5c7428f1a8a6278d4d5c7。
 - 新 ZIP 已替换同名旧包；最终来源提交、SHA-256 和上传结果以 ZIP 清单及本次交付回复为准。
 
 ## 关键决定与下一步
 
 - 配置与凭据留在用户配置目录，项目目录仅放程序和公开说明。上传不包含 config.toml、auth.json、DPAPI、备份、日志、.verification、依赖缓存和旧 ZIP。
 - 分享 Canvas 补丁及交接 MD，不收集或迁移私人会话、画布和配对令牌。
-- 源码和说明已同步；继续完成同版 ZIP 附件发布及远端校验。复杂使用体验仍由用户确认。
+- 本次打包、说明和上传已完成；后续按交接 MD 在新电脑安装和授权。复杂使用体验仍由用户确认。
